@@ -2,9 +2,7 @@ package templates
 
 import (
 	"fmt"
-	"io/ioutil"
-	"os"
-	"strings"
+	"reflect"
 
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
@@ -15,6 +13,7 @@ import (
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/offlinehttp"
 	"github.com/projectdiscovery/nuclei/v2/pkg/templates/cache"
 	"github.com/projectdiscovery/nuclei/v2/pkg/utils"
+	stringsutil "github.com/projectdiscovery/utils/strings"
 )
 
 var (
@@ -28,8 +27,9 @@ func init() {
 }
 
 // Parse parses a yaml request template file
-//nolint:gocritic // this cannot be passed by pointer
 // TODO make sure reading from the disk the template parsing happens once: see parsers.ParseTemplate vs templates.Parse
+//
+//nolint:gocritic // this cannot be passed by pointer
 func Parse(filePath string, preprocessor Preprocessor, options protocols.ExecuterOptions) (*Template, error) {
 	if value, err := parsedTemplatesCache.Has(filePath); value != nil {
 		return value.(*Template), err
@@ -37,13 +37,7 @@ func Parse(filePath string, preprocessor Preprocessor, options protocols.Execute
 
 	template := &Template{}
 
-	f, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	data, err := ioutil.ReadAll(f)
+	data, err := utils.ReadFromPathOrURL(filePath, options.Catalog)
 	if err != nil {
 		return nil, err
 	}
@@ -68,9 +62,14 @@ func Parse(filePath string, preprocessor Preprocessor, options protocols.Execute
 	options.TemplateID = template.ID
 	options.TemplateInfo = template.Info
 	options.TemplatePath = filePath
+	options.StopAtFirstMatch = template.StopAtFirstMatch
+
+	if template.Variables.Len() > 0 {
+		options.Variables = template.Variables
+	}
 
 	// If no requests, and it is also not a workflow, return error.
-	if len(template.RequestsDNS)+len(template.RequestsHTTP)+len(template.RequestsFile)+len(template.RequestsNetwork)+len(template.RequestsHeadless)+len(template.Workflows) == 0 {
+	if template.Requests() == 0 {
 		return nil, fmt.Errorf("no requests defined for %s", template.ID)
 	}
 
@@ -83,61 +82,15 @@ func Parse(filePath string, preprocessor Preprocessor, options protocols.Execute
 		template.CompiledWorkflow.Options = &options
 	}
 
-	// Compile the requests found
-	requests := []protocols.Request{}
-	if len(template.RequestsDNS) > 0 && !options.Options.OfflineHTTP {
-		for _, req := range template.RequestsDNS {
-			requests = append(requests, req)
-		}
-		template.Executer = executer.NewExecuter(requests, &options)
+	if err := template.compileProtocolRequests(options); err != nil {
+		return nil, err
 	}
-	if len(template.RequestsHTTP) > 0 {
-		if options.Options.OfflineHTTP {
-			operatorsList := []*operators.Operators{}
 
-		mainLoop:
-			for _, req := range template.RequestsHTTP {
-				for _, path := range req.Path {
-					if !(strings.EqualFold(path, "{{BaseURL}}") || strings.EqualFold(path, "{{BaseURL}}/")) {
-						break mainLoop
-					}
-				}
-				operatorsList = append(operatorsList, &req.Operators)
-			}
-			if len(operatorsList) > 0 {
-				options.Operators = operatorsList
-				template.Executer = executer.NewExecuter([]protocols.Request{&offlinehttp.Request{}}, &options)
-			}
-		} else {
-			for _, req := range template.RequestsHTTP {
-				requests = append(requests, req)
-			}
-			template.Executer = executer.NewExecuter(requests, &options)
-		}
-	}
-	if len(template.RequestsFile) > 0 && !options.Options.OfflineHTTP {
-		for _, req := range template.RequestsFile {
-			requests = append(requests, req)
-		}
-		template.Executer = executer.NewExecuter(requests, &options)
-	}
-	if len(template.RequestsNetwork) > 0 && !options.Options.OfflineHTTP {
-		for _, req := range template.RequestsNetwork {
-			requests = append(requests, req)
-		}
-		template.Executer = executer.NewExecuter(requests, &options)
-	}
-	if len(template.RequestsHeadless) > 0 && !options.Options.OfflineHTTP && options.Options.Headless {
-		for _, req := range template.RequestsHeadless {
-			requests = append(requests, req)
-		}
-		template.Executer = executer.NewExecuter(requests, &options)
-	}
 	if template.Executer != nil {
 		if err := template.Executer.Compile(); err != nil {
 			return nil, errors.Wrap(err, "could not compile request")
 		}
-		template.TotalRequests += template.Executer.Requests()
+		template.TotalRequests = template.Executer.Requests()
 	}
 	if template.Executer == nil && template.CompiledWorkflow == nil {
 		return nil, ErrCreateTemplateExecutor
@@ -151,14 +104,120 @@ func Parse(filePath string, preprocessor Preprocessor, options protocols.Execute
 }
 
 // parseSelfContainedRequests parses the self contained template requests.
-func (t *Template) parseSelfContainedRequests() {
-	if !t.SelfContained {
+func (template *Template) parseSelfContainedRequests() {
+	if template.Signature.Value.String() != "" {
+		for _, request := range template.RequestsHTTP {
+			request.Signature = template.Signature
+		}
+	}
+	if !template.SelfContained {
 		return
 	}
-	for _, request := range t.RequestsHTTP {
+	for _, request := range template.RequestsHTTP {
 		request.SelfContained = true
 	}
-	for _, request := range t.RequestsNetwork {
+	for _, request := range template.RequestsNetwork {
 		request.SelfContained = true
+	}
+}
+
+// Requests returns the total request count for the template
+func (template *Template) Requests() int {
+	return len(template.RequestsDNS) +
+		len(template.RequestsHTTP) +
+		len(template.RequestsFile) +
+		len(template.RequestsNetwork) +
+		len(template.RequestsHeadless) +
+		len(template.Workflows) +
+		len(template.RequestsSSL) +
+		len(template.RequestsWebsocket) +
+		len(template.RequestsWHOIS)
+}
+
+// compileProtocolRequests compiles all the protocol requests for the template
+func (template *Template) compileProtocolRequests(options protocols.ExecuterOptions) error {
+	templateRequests := template.Requests()
+
+	if templateRequests == 0 {
+		return fmt.Errorf("no requests defined for %s", template.ID)
+	}
+
+	if options.Options.OfflineHTTP {
+		template.compileOfflineHTTPRequest(options)
+		return nil
+	}
+
+	var requests []protocols.Request
+
+	if len(template.RequestsDNS) > 0 {
+		requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsDNS)...)
+	}
+	if len(template.RequestsFile) > 0 {
+		requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsFile)...)
+	}
+	if len(template.RequestsNetwork) > 0 {
+		requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsNetwork)...)
+	}
+	if len(template.RequestsHTTP) > 0 {
+		requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsHTTP)...)
+	}
+	if len(template.RequestsHeadless) > 0 && options.Options.Headless {
+		requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsHeadless)...)
+	}
+	if len(template.RequestsSSL) > 0 {
+		requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsSSL)...)
+	}
+	if len(template.RequestsWebsocket) > 0 {
+		requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsWebsocket)...)
+	}
+	if len(template.RequestsWHOIS) > 0 {
+		requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsWHOIS)...)
+	}
+	template.Executer = executer.NewExecuter(requests, &options)
+	return nil
+}
+
+// convertRequestToProtocolsRequest is a convenience wrapper to convert
+// arbitrary interfaces which are slices of requests from the template to a
+// slice of protocols.Request interface items.
+func (template *Template) convertRequestToProtocolsRequest(requests interface{}) []protocols.Request {
+	switch reflect.TypeOf(requests).Kind() {
+	case reflect.Slice:
+		s := reflect.ValueOf(requests)
+
+		requestSlice := make([]protocols.Request, s.Len())
+		for i := 0; i < s.Len(); i++ {
+			value := s.Index(i)
+			valueInterface := value.Interface()
+			requestSlice[i] = valueInterface.(protocols.Request)
+		}
+		return requestSlice
+	}
+	return nil
+}
+
+// compileOfflineHTTPRequest iterates all requests if offline http mode is
+// specified and collects all matchers for all the base request templates
+// (those with URL {{BaseURL}} and it's slash variation.)
+func (template *Template) compileOfflineHTTPRequest(options protocols.ExecuterOptions) {
+	operatorsList := []*operators.Operators{}
+
+mainLoop:
+	for _, req := range template.RequestsHTTP {
+		hasPaths := len(req.Path) > 0
+		if !hasPaths {
+			break mainLoop
+		}
+		for _, path := range req.Path {
+			pathIsBaseURL := stringsutil.EqualFoldAny(path, "{{BaseURL}}", "{{BaseURL}}/", "/")
+			if !pathIsBaseURL {
+				break mainLoop
+			}
+		}
+		operatorsList = append(operatorsList, &req.Operators)
+	}
+	if len(operatorsList) > 0 {
+		options.Operators = operatorsList
+		template.Executer = executer.NewExecuter([]protocols.Request{&offlinehttp.Request{}}, &options)
 	}
 }

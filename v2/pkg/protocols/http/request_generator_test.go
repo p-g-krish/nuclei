@@ -3,15 +3,17 @@ package http
 import (
 	"testing"
 
-	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/generators"
 	"github.com/stretchr/testify/require"
+
+	"github.com/projectdiscovery/nuclei/v2/pkg/catalog/disk"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/generators"
 )
 
 func TestRequestGeneratorPaths(t *testing.T) {
 	req := &Request{
 		Path: []string{"{{BaseURL}}/test", "{{BaseURL}}/test.php"},
 	}
-	generator := req.newGenerator()
+	generator := req.newGenerator(false)
 	var payloads []string
 	for {
 		raw, _, ok := generator.nextValue()
@@ -28,13 +30,14 @@ func TestRequestGeneratorClusterBombSingle(t *testing.T) {
 
 	req := &Request{
 		Payloads:   map[string]interface{}{"username": []string{"admin", "tomcat", "manager"}, "password": []string{"password", "test", "secret"}},
-		attackType: generators.ClusterBomb,
+		AttackType: generators.AttackTypeHolder{Value: generators.ClusterBombAttack},
 		Raw:        []string{`GET /{{username}}:{{password}} HTTP/1.1`},
 	}
-	req.generator, err = generators.New(req.Payloads, req.attackType, "")
+	catalogInstance := disk.NewCatalog("")
+	req.generator, err = generators.New(req.Payloads, req.AttackType.Value, "", "", false, catalogInstance, "")
 	require.Nil(t, err, "could not create generator")
 
-	generator := req.newGenerator()
+	generator := req.newGenerator(false)
 	var payloads []map[string]interface{}
 	for {
 		_, data, ok := generator.nextValue()
@@ -51,13 +54,14 @@ func TestRequestGeneratorClusterBombMultipleRaw(t *testing.T) {
 
 	req := &Request{
 		Payloads:   map[string]interface{}{"username": []string{"admin", "tomcat", "manager"}, "password": []string{"password", "test", "secret"}},
-		attackType: generators.ClusterBomb,
+		AttackType: generators.AttackTypeHolder{Value: generators.ClusterBombAttack},
 		Raw:        []string{`GET /{{username}}:{{password}} HTTP/1.1`, `GET /{{username}}@{{password}} HTTP/1.1`},
 	}
-	req.generator, err = generators.New(req.Payloads, req.attackType, "")
+	catalogInstance := disk.NewCatalog("")
+	req.generator, err = generators.New(req.Payloads, req.AttackType.Value, "", "", false, catalogInstance, "")
 	require.Nil(t, err, "could not create generator")
 
-	generator := req.newGenerator()
+	generator := req.newGenerator(false)
 	var payloads []map[string]interface{}
 	for {
 		_, data, ok := generator.nextValue()

@@ -1,19 +1,22 @@
 package http
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
+	json "github.com/json-iterator/go"
 	"github.com/pkg/errors"
 
-	"github.com/projectdiscovery/fileutil"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/expressions"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/generators"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/http/fuzz"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/http/httpclientpool"
 	"github.com/projectdiscovery/rawhttp"
 	"github.com/projectdiscovery/retryablehttp-go"
+	fileutil "github.com/projectdiscovery/utils/file"
 )
 
 // Request contains a http request to be made from a template
@@ -41,32 +44,21 @@ type Request struct {
 	//  Name is the optional name of the request.
 	//
 	//  If a name is specified, all the named request in a template can be matched upon
-	//  in a combined manner allowing multirequest based matchers.
+	//  in a combined manner allowing multi-request based matchers.
 	Name string `yaml:"name,omitempty" jsonschema:"title=name for the http request,description=Optional name for the HTTP Request"`
 	// description: |
 	//   Attack is the type of payload combinations to perform.
 	//
-	//   batteringram is same payload into all of the defined payload positions at once, pitchfork combines multiple payload sets and clusterbomb generates
+	//   batteringram is inserts the same payload into all defined payload positions at once, pitchfork combines multiple payload sets and clusterbomb generates
 	//   permutations and combinations for all payloads.
 	// values:
 	//   - "batteringram"
 	//   - "pitchfork"
 	//   - "clusterbomb"
-	AttackType string `yaml:"attack,omitempty" jsonschema:"title=attack is the payload combination,description=Attack is the type of payload combinations to perform,enum=batteringram,enum=pitchfork,enum=clusterbomb"`
+	AttackType generators.AttackTypeHolder `yaml:"attack,omitempty" jsonschema:"title=attack is the payload combination,description=Attack is the type of payload combinations to perform,enum=batteringram,enum=pitchfork,enum=clusterbomb"`
 	// description: |
 	//   Method is the HTTP Request Method.
-	// values:
-	//   - "GET"
-	//   - "HEAD"
-	//   - "POST"
-	//   - "PUT"
-	//   - "DELETE"
-	//   - "CONNECT"
-	//   - "OPTIONS"
-	//   - "TRACE"
-	//   - "PATCH"
-	//   - "PURGE"
-	Method string `yaml:"method,omitempty" jsonschema:"title=method is the http request method,description=Method is the HTTP Request Method,enum=GET,enum=HEAD,enum=POST,enum=PUT,enum=DELETE,enum=CONNECT,enum=OPTIONS,enum=TRACE,enum=PATCH,enum=PURGE"`
+	Method HTTPMethodTypeHolder `yaml:"method,omitempty" jsonschema:"title=method is the http request method,description=Method is the HTTP Request Method,enum=GET,enum=HEAD,enum=POST,enum=PUT,enum=DELETE,enum=CONNECT,enum=OPTIONS,enum=TRACE,enum=PATCH,enum=PURGE"`
 	// description: |
 	//   Body is an optional parameter which contains HTTP Request body.
 	// examples:
@@ -80,6 +72,7 @@ type Request struct {
 	//   of payloads is provided, or optionally a single file can also
 	//   be provided as payload which will be read on run-time.
 	Payloads map[string]interface{} `yaml:"payloads,omitempty" jsonschema:"title=payloads for the http request,description=Payloads contains any payloads for the current request"`
+
 	// description: |
 	//   Headers contains HTTP Headers to send with the request.
 	// examples:
@@ -126,30 +119,47 @@ type Request struct {
 	//     value: 2048
 	MaxSize int `yaml:"max-size,omitempty" jsonschema:"title=maximum http response body size,description=Maximum size of http response body to read in bytes"`
 
+	// Fuzzing describes schema to fuzz http requests
+	Fuzzing []*fuzz.Rule `yaml:"fuzzing,omitempty" jsonschema:"title=fuzzin rules for http fuzzing,description=Fuzzing describes rule schema to fuzz http requests"`
+
 	CompiledOperators *operators.Operators `yaml:"-"`
 
-	options       *protocols.ExecuterOptions
-	attackType    generators.Type
-	totalRequests int
-	customHeaders map[string]string
-	generator     *generators.Generator // optional, only enabled when using payloads
-	httpClient    *retryablehttp.Client
-	rawhttpClient *rawhttp.Client
-	dynamicValues map[string]interface{}
+	options           *protocols.ExecuterOptions
+	connConfiguration *httpclientpool.Configuration
+	totalRequests     int
+	customHeaders     map[string]string
+	generator         *generators.PayloadGenerator // optional, only enabled when using payloads
+	httpClient        *retryablehttp.Client
+	rawhttpClient     *rawhttp.Client
 
 	// description: |
-	//   SelfContained specifies if the request is self contained.
+	//   SelfContained specifies if the request is self-contained.
 	SelfContained bool `yaml:"-" json:"-"`
+
+	// description: |
+	//   Signature is the request signature method
+	// values:
+	//   - "AWS"
+	Signature SignatureTypeHolder `yaml:"signature,omitempty" jsonschema:"title=signature is the http request signature method,description=Signature is the HTTP Request signature Method,enum=AWS"`
 
 	// description: |
 	//   CookieReuse is an optional setting that enables cookie reuse for
 	//   all requests defined in raw section.
 	CookieReuse bool `yaml:"cookie-reuse,omitempty" jsonschema:"title=optional cookie reuse enable,description=Optional setting that enables cookie reuse"`
 	// description: |
+	//   Enables force reading of the entire raw unsafe request body ignoring
+	//   any specified content length headers.
+	ForceReadAllBody bool `yaml:"read-all,omitempty" jsonschema:"title=force read all body,description=Enables force reading of entire unsafe http request body"`
+	// description: |
 	//   Redirects specifies whether redirects should be followed by the HTTP Client.
 	//
 	//   This can be used in conjunction with `max-redirects` to control the HTTP request redirects.
 	Redirects bool `yaml:"redirects,omitempty" jsonschema:"title=follow http redirects,description=Specifies whether redirects should be followed by the HTTP Client"`
+	// description: |
+	//   Redirects specifies whether only redirects to the same host should be followed by the HTTP Client.
+	//
+	//   This can be used in conjunction with `max-redirects` to control the HTTP request redirects.
+	HostRedirects bool `yaml:"host-redirects,omitempty" jsonschema:"title=follow same host http redirects,description=Specifies whether redirects to the same host should be followed by the HTTP Client"`
 	// description: |
 	//   Pipeline defines if the attack should be performed with HTTP 1.1 Pipelining
 	//
@@ -170,6 +180,7 @@ type Request struct {
 	//   ReqCondition automatically assigns numbers to requests and preserves their history.
 	//
 	//   This allows matching on them later for multi-request conditions.
+	// Deprecated: request condition will be detected automatically (https://github.com/projectdiscovery/nuclei/issues/2393)
 	ReqCondition bool `yaml:"req-condition,omitempty" jsonschema:"title=preserve request history,description=Automatically assigns numbers to requests and preserves their history"`
 	// description: |
 	//   StopAtFirstMatch stops the execution of the requests and template as soon as a match is found.
@@ -177,6 +188,42 @@ type Request struct {
 	// description: |
 	//   SkipVariablesCheck skips the check for unresolved variables in request
 	SkipVariablesCheck bool `yaml:"skip-variables-check,omitempty" jsonschema:"title=skip variable checks,description=Skips the check for unresolved variables in request"`
+	// description: |
+	//   IterateAll iterates all the values extracted from internal extractors
+	IterateAll bool `yaml:"iterate-all,omitempty" jsonschema:"title=iterate all the values,description=Iterates all the values extracted from internal extractors"`
+	// description: |
+	//   DigestAuthUsername specifies the username for digest authentication
+	DigestAuthUsername string `yaml:"digest-username,omitempty" jsonschema:"title=specifies the username for digest authentication,description=Optional parameter which specifies the username for digest auth"`
+	// description: |
+	//   DigestAuthPassword specifies the password for digest authentication
+	DigestAuthPassword string `yaml:"digest-password,omitempty" jsonschema:"title=specifies the password for digest authentication,description=Optional parameter which specifies the password for digest auth"`
+}
+
+// Options returns executer options for http request
+func (r *Request) Options() *protocols.ExecuterOptions {
+	return r.options
+}
+
+// RequestPartDefinitions contains a mapping of request part definitions and their
+// description. Multiple definitions are separated by commas.
+// Definitions not having a name (generated on runtime) are prefixed & suffixed by <>.
+var RequestPartDefinitions = map[string]string{
+	"template-id":           "ID of the template executed",
+	"template-info":         "Info Block of the template executed",
+	"template-path":         "Path of the template executed",
+	"host":                  "Host is the input to the template",
+	"matched":               "Matched is the input which was matched upon",
+	"type":                  "Type is the type of request made",
+	"request":               "HTTP request made from the client",
+	"response":              "HTTP response received from server",
+	"status_code":           "Status Code received from the Server",
+	"body":                  "HTTP response body received from server (default)",
+	"content_length":        "HTTP Response content length",
+	"header,all_headers":    "HTTP response headers",
+	"duration":              "HTTP request time duration",
+	"all":                   "HTTP response body + headers",
+	"cookies_from_response": "HTTP response cookies in name:value format",
+	"headers_from_response": "HTTP response headers in name:value format",
 }
 
 // GetID returns the unique ID of the request if any.
@@ -190,17 +237,33 @@ func (request *Request) isRaw() bool {
 
 // Compile compiles the protocol request for further execution.
 func (request *Request) Compile(options *protocols.ExecuterOptions) error {
-	connectionConfiguration := &httpclientpool.Configuration{
-		Threads:         request.Threads,
-		MaxRedirects:    request.MaxRedirects,
-		FollowRedirects: request.Redirects,
-		CookieReuse:     request.CookieReuse,
+	if err := request.validate(); err != nil {
+		return errors.Wrap(err, "validation error")
 	}
 
-	// if the headers contain "Connection" we need to disable the automatic keep alive of the standard library
-	if _, hasConnectionHeader := request.Headers["Connection"]; hasConnectionHeader {
-		connectionConfiguration.Connection = &httpclientpool.ConnectionConfiguration{DisableKeepAlive: false}
+	connectionConfiguration := &httpclientpool.Configuration{
+		Threads:      request.Threads,
+		MaxRedirects: request.MaxRedirects,
+		NoTimeout:    false,
+		CookieReuse:  request.CookieReuse,
+		Connection:   &httpclientpool.ConnectionConfiguration{DisableKeepAlive: true},
+		RedirectFlow: httpclientpool.DontFollowRedirect,
 	}
+
+	if request.Redirects || options.Options.FollowRedirects {
+		connectionConfiguration.RedirectFlow = httpclientpool.FollowAllRedirect
+	}
+	if request.HostRedirects || options.Options.FollowHostRedirects {
+		connectionConfiguration.RedirectFlow = httpclientpool.FollowSameHostRedirect
+	}
+
+	// If we have request level timeout, ignore http client timeouts
+	for _, req := range request.Raw {
+		if reTimeoutAnnotation.MatchString(req) {
+			connectionConfiguration.NoTimeout = true
+		}
+	}
+	request.connConfiguration = connectionConfiguration
 
 	client, err := httpclientpool.Get(options.Options, connectionConfiguration)
 	if err != nil {
@@ -230,6 +293,8 @@ func (request *Request) Compile(options *protocols.ExecuterOptions) error {
 	}
 	if len(request.Matchers) > 0 || len(request.Extractors) > 0 {
 		compiled := &request.Operators
+		compiled.ExcludeMatchers = options.ExcludeMatchers
+		compiled.TemplateID = options.TemplateID
 		if compileErr := compiled.Compile(); compileErr != nil {
 			return errors.Wrap(compileErr, "could not compile operators")
 		}
@@ -243,7 +308,7 @@ func (request *Request) Compile(options *protocols.ExecuterOptions) error {
 		var hasPayloadName bool
 		// search for markers in all request parts
 		var inputs []string
-		inputs = append(inputs, request.Method, request.Body)
+		inputs = append(inputs, request.Method.String(), request.Body)
 		inputs = append(inputs, request.Raw...)
 		for k, v := range request.customHeaders {
 			inputs = append(inputs, fmt.Sprintf("%s: %s", k, v))
@@ -253,7 +318,7 @@ func (request *Request) Compile(options *protocols.ExecuterOptions) error {
 		}
 
 		for _, input := range inputs {
-			if expressions.ContainsVariablesWithNames(input, map[string]interface{}{name: payload}) == nil {
+			if expressions.ContainsVariablesWithNames(map[string]interface{}{name: payload}, input) == nil {
 				hasPayloadName = true
 				break
 			}
@@ -266,42 +331,56 @@ func (request *Request) Compile(options *protocols.ExecuterOptions) error {
 		}
 	}
 
-	if len(request.Payloads) > 0 {
-		attackType := request.AttackType
-		if attackType == "" {
-			attackType = "batteringram"
-		}
-		var ok bool
-		request.attackType, ok = generators.StringToType[attackType]
-		if !ok {
-			return fmt.Errorf("invalid attack type provided: %s", attackType)
-		}
-
-		// Resolve payload paths if they are files.
-		for name, payload := range request.Payloads {
-			payloadStr, ok := payload.(string)
-			if ok {
-				final, resolveErr := options.Catalog.ResolvePath(payloadStr, options.TemplatePath)
-				if resolveErr != nil {
-					return errors.Wrap(resolveErr, "could not read payload file")
-				}
-				request.Payloads[name] = final
+	// tries to drop unused payloads - by marshaling sections that might contain the payload
+	unusedPayloads := make(map[string]struct{})
+	requestSectionsToCheck := []interface{}{
+		request.customHeaders, request.Headers, request.Matchers,
+		request.Extractors, request.Body, request.Path, request.Raw, request.Fuzzing,
+	}
+	if requestSectionsToCheckData, err := json.Marshal(requestSectionsToCheck); err == nil {
+		for payload := range request.Payloads {
+			if bytes.Contains(requestSectionsToCheckData, []byte(payload)) {
+				continue
 			}
+			unusedPayloads[payload] = struct{}{}
 		}
-		request.generator, err = generators.New(request.Payloads, request.attackType, request.options.TemplatePath)
+	}
+	for payload := range unusedPayloads {
+		delete(request.Payloads, payload)
+	}
+
+	if len(request.Payloads) > 0 {
+		request.generator, err = generators.New(request.Payloads, request.AttackType.Value, request.options.TemplatePath, request.options.Options.TemplatesDirectory, request.options.Options.Sandbox, request.options.Catalog, request.options.Options.AttackType)
 		if err != nil {
 			return errors.Wrap(err, "could not parse payloads")
 		}
 	}
 	request.options = options
 	request.totalRequests = request.Requests()
+
+	if len(request.Fuzzing) > 0 {
+		if request.Unsafe {
+			return errors.New("cannot use unsafe with http fuzzing templates")
+		}
+		for _, rule := range request.Fuzzing {
+			if err := rule.Compile(request.generator, request.options); err != nil {
+				return errors.Wrap(err, "could not compile fuzzing rule")
+			}
+		}
+	}
 	return nil
 }
 
 // Requests returns the total number of requests the YAML rule will perform
 func (request *Request) Requests() int {
 	if request.generator != nil {
-		payloadRequests := request.generator.NewIterator().Total() * len(request.Raw)
+		payloadRequests := request.generator.NewIterator().Total()
+		if len(request.Raw) > 0 {
+			payloadRequests = payloadRequests * len(request.Raw)
+		}
+		if len(request.Path) > 0 {
+			payloadRequests = payloadRequests * len(request.Path)
+		}
 		return payloadRequests
 	}
 	if len(request.Raw) > 0 {

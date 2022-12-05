@@ -1,20 +1,20 @@
 package file
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/projectdiscovery/nuclei/v2/internal/testutils"
 	"github.com/projectdiscovery/nuclei/v2/pkg/model"
 	"github.com/projectdiscovery/nuclei/v2/pkg/model/types/severity"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/extractors"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/matchers"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/contextargs"
+	"github.com/projectdiscovery/nuclei/v2/pkg/testutils"
 )
 
 func TestFileExecuteWithResults(t *testing.T) {
@@ -22,34 +22,35 @@ func TestFileExecuteWithResults(t *testing.T) {
 
 	testutils.Init(options)
 	templateID := "testing-file"
-	request := &Request{
-		ID:                templateID,
-		MaxSize:           1024,
-		NoRecursive:       false,
-		Extensions:        []string{"all"},
-		ExtensionDenylist: []string{".go"},
-		Operators: operators.Operators{
-			Matchers: []*matchers.Matcher{{
-				Name:  "test",
-				Part:  "raw",
-				Type:  "word",
-				Words: []string{"1.1.1.1"},
-			}},
-			Extractors: []*extractors.Extractor{{
-				Part:  "raw",
-				Type:  "regex",
-				Regex: []string{"[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"},
-			}},
-		},
-	}
 	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
 		ID:   templateID,
 		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
 	})
+	request := &Request{
+		ID:          templateID,
+		MaxSize:     "1Gb",
+		NoRecursive: false,
+		Extensions:  []string{"all"},
+		DenyList:    []string{".go"},
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Name:  "test",
+				Part:  "raw",
+				Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+				Words: []string{"1.1.1.1"},
+			}},
+			Extractors: []*extractors.Extractor{{
+				Part:  "raw",
+				Type:  extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor},
+				Regex: []string{"[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"},
+			}},
+		},
+		options: executerOpts,
+	}
 	err := request.Compile(executerOpts)
 	require.Nil(t, err, "could not compile file request")
 
-	tempDir, err := ioutil.TempDir("", "test-*")
+	tempDir, err := os.MkdirTemp("", "test-*")
 	require.Nil(t, err, "could not create temporary directory")
 	defer os.RemoveAll(tempDir)
 
@@ -57,7 +58,7 @@ func TestFileExecuteWithResults(t *testing.T) {
 		"config.yaml": "TEST\r\n1.1.1.1\r\n",
 	}
 	for k, v := range files {
-		err = ioutil.WriteFile(filepath.Join(tempDir, k), []byte(v), 0777)
+		err = os.WriteFile(filepath.Join(tempDir, k), []byte(v), os.ModePerm)
 		require.Nil(t, err, "could not write temporary file")
 	}
 
@@ -65,7 +66,8 @@ func TestFileExecuteWithResults(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
 		metadata := make(output.InternalEvent)
 		previous := make(output.InternalEvent)
-		err := request.ExecuteWithResults(tempDir, metadata, previous, func(event *output.InternalWrappedEvent) {
+		ctxArgs := contextargs.NewWithInput(tempDir)
+		err := request.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {
 			finalEvent = event
 		})
 		require.Nil(t, err, "could not execute file request")

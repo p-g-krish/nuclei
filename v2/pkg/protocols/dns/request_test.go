@@ -5,45 +5,48 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/projectdiscovery/nuclei/v2/internal/testutils"
 	"github.com/projectdiscovery/nuclei/v2/pkg/model"
 	"github.com/projectdiscovery/nuclei/v2/pkg/model/types/severity"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/extractors"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/matchers"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/contextargs"
+	"github.com/projectdiscovery/nuclei/v2/pkg/testutils"
 )
 
 func TestDNSExecuteWithResults(t *testing.T) {
 	options := testutils.DefaultOptions
 
+	recursion := false
 	testutils.Init(options)
 	templateID := "testing-dns"
-	request := &Request{
-		Type:      "A",
-		Class:     "INET",
-		Retries:   5,
-		ID:        templateID,
-		Recursion: false,
-		Name:      "{{FQDN}}",
-		Operators: operators.Operators{
-			Matchers: []*matchers.Matcher{{
-				Name:  "test",
-				Part:  "raw",
-				Type:  "word",
-				Words: []string{"93.184.216.34"},
-			}},
-			Extractors: []*extractors.Extractor{{
-				Part:  "raw",
-				Type:  "regex",
-				Regex: []string{"[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"},
-			}},
-		},
-	}
 	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
 		ID:   templateID,
 		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
 	})
+	request := &Request{
+		RequestType: DNSRequestTypeHolder{DNSRequestType: A},
+		Class:       "INET",
+		Retries:     5,
+		ID:          templateID,
+		Recursion:   &recursion,
+		Name:        "{{FQDN}}",
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Name:  "test",
+				Part:  "raw",
+				Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+				Words: []string{"93.184.216.34"},
+			}},
+			Extractors: []*extractors.Extractor{{
+				Part:  "raw",
+				Type:  extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor},
+				Regex: []string{"[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"},
+			}},
+		},
+		options: executerOpts,
+	}
 	err := request.Compile(executerOpts)
 	require.Nil(t, err, "could not compile dns request")
 
@@ -51,7 +54,8 @@ func TestDNSExecuteWithResults(t *testing.T) {
 	t.Run("domain-valid", func(t *testing.T) {
 		metadata := make(output.InternalEvent)
 		previous := make(output.InternalEvent)
-		err := request.ExecuteWithResults("example.com", metadata, previous, func(event *output.InternalWrappedEvent) {
+		ctxArgs := contextargs.NewWithInput("example.com")
+		err := request.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {
 			finalEvent = event
 		})
 		require.Nil(t, err, "could not execute dns request")
@@ -66,7 +70,7 @@ func TestDNSExecuteWithResults(t *testing.T) {
 	t.Run("url-to-domain", func(t *testing.T) {
 		metadata := make(output.InternalEvent)
 		previous := make(output.InternalEvent)
-		err := request.ExecuteWithResults("https://example.com", metadata, previous, func(event *output.InternalWrappedEvent) {
+		err := request.ExecuteWithResults(contextargs.NewWithInput("https://example.com"), metadata, previous, func(event *output.InternalWrappedEvent) {
 			finalEvent = event
 		})
 		require.Nil(t, err, "could not execute dns request")

@@ -1,17 +1,16 @@
 package offlinehttp
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/projectdiscovery/nuclei/v2/internal/testutils"
 	"github.com/projectdiscovery/nuclei/v2/pkg/model"
 	"github.com/projectdiscovery/nuclei/v2/pkg/model/types/severity"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators"
+	"github.com/projectdiscovery/nuclei/v2/pkg/testutils"
 )
 
 func TestFindResponses(t *testing.T) {
@@ -28,7 +27,7 @@ func TestFindResponses(t *testing.T) {
 	err := request.Compile(executerOpts)
 	require.Nil(t, err, "could not compile file request")
 
-	tempDir, err := ioutil.TempDir("", "test-*")
+	tempDir, err := os.MkdirTemp("", "test-*")
 	require.Nil(t, err, "could not create temporary directory")
 	defer os.RemoveAll(tempDir)
 
@@ -40,7 +39,7 @@ func TestFindResponses(t *testing.T) {
 		"test.txt":          "TEST",
 	}
 	for k, v := range files {
-		err = ioutil.WriteFile(filepath.Join(tempDir, k), []byte(v), 0777)
+		err = os.WriteFile(filepath.Join(tempDir, k), []byte(v), os.ModePerm)
 		require.Nil(t, err, "could not write temporary file")
 	}
 	expected := []string{"config.txt", "final.txt", "test.txt"}

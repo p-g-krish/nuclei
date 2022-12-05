@@ -2,6 +2,7 @@ package templates
 
 import (
 	"github.com/pkg/errors"
+
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v2/pkg/model"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols"
@@ -22,7 +23,7 @@ func compileWorkflow(path string, preprocessor Preprocessor, options *protocols.
 func parseWorkflow(preprocessor Preprocessor, workflow *workflows.WorkflowTemplate, options *protocols.ExecuterOptions, loader model.WorkflowLoader) error {
 	shouldNotValidate := false
 
-	if len(workflow.Template) == 0 && workflow.Tags.IsEmpty() {
+	if workflow.Template == "" && workflow.Tags.IsEmpty() {
 		return errors.New("invalid workflow with no templates or tags")
 	}
 	if len(workflow.Subtemplates) > 0 || len(workflow.Matchers) > 0 {
@@ -38,6 +39,11 @@ func parseWorkflow(preprocessor Preprocessor, workflow *workflows.WorkflowTempla
 		}
 	}
 	for _, matcher := range workflow.Matchers {
+		if len(matcher.Name.ToSlice()) > 0 {
+			if err := matcher.Compile(); err != nil {
+				return errors.Wrap(err, "could not compile workflow matcher")
+			}
+		}
 		for _, subtemplates := range matcher.Subtemplates {
 			if err := parseWorkflow(preprocessor, subtemplates, options, loader); err != nil {
 				gologger.Warning().Msgf("Could not parse workflow: %v\n", err)
@@ -61,20 +67,11 @@ func parseWorkflowTemplate(workflow *workflows.WorkflowTemplate, preprocessor Pr
 	if len(paths) == 0 {
 		return nil
 	}
+
+	var workflowTemplates []*Template
+
 	for _, path := range paths {
-		opts := protocols.ExecuterOptions{
-			Output:          options.Output,
-			Options:         options.Options,
-			Progress:        options.Progress,
-			Catalog:         options.Catalog,
-			Browser:         options.Browser,
-			RateLimiter:     options.RateLimiter,
-			IssuesClient:    options.IssuesClient,
-			Interactsh:      options.Interactsh,
-			ProjectFile:     options.ProjectFile,
-			HostErrorsCache: options.HostErrorsCache,
-		}
-		template, err := Parse(path, preprocessor, opts)
+		template, err := Parse(path, preprocessor, options.Copy())
 		if err != nil {
 			gologger.Warning().Msgf("Could not parse workflow template %s: %v\n", path, err)
 			continue
@@ -83,10 +80,17 @@ func parseWorkflowTemplate(workflow *workflows.WorkflowTemplate, preprocessor Pr
 			gologger.Warning().Msgf("Could not parse workflow template %s: no executer found\n", path)
 			continue
 		}
+		workflowTemplates = append(workflowTemplates, template)
+	}
+
+	finalTemplates, _ := ClusterTemplates(workflowTemplates, options.Copy())
+	for _, template := range finalTemplates {
 		workflow.Executers = append(workflow.Executers, &workflows.ProtocolExecuterPair{
-			Executer: template.Executer,
-			Options:  options,
+			Executer:     template.Executer,
+			Options:      options,
+			TemplateType: template.Type(),
 		})
 	}
+
 	return nil
 }

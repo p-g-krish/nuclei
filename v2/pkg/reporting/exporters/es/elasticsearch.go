@@ -3,36 +3,41 @@ package es
 import (
 	"bytes"
 	"crypto/tls"
-	"fmt"
-	"io/ioutil"
-	"net/http"
-	"strings"
-	"time"
-
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"github.com/corpix/uarand"
+	"io"
+	"net/http"
+	"time"
 
 	"github.com/pkg/errors"
+
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/protocolstate"
+	"github.com/projectdiscovery/retryablehttp-go"
 )
 
-// Options contains necessary options required for elasticsearch communicaiton
+// Options contains necessary options required for elasticsearch communication
 type Options struct {
+	// Host is the hostname of the elasticsearch instance
+	Host string `yaml:"host" validate:"required_without=IP"`
 	// IP for elasticsearch instance
-	IP string `yaml:"ip"`
+	IP string `yaml:"ip" validate:"required,ip"`
 	// Port is the port of elasticsearch instance
-	Port int `yaml:"port"`
+	Port int `yaml:"port" validate:"gte=0,lte=65535"`
 	// SSL (optional) enables ssl for elasticsearch connection
 	SSL bool `yaml:"ssl"`
 	// SSLVerification (optional) disables SSL verification for elasticsearch
 	SSLVerification bool `yaml:"ssl-verification"`
 	// Username for the elasticsearch instance
-	Username string `yaml:"username"`
+	Username string `yaml:"username"  validate:"required"`
 	// Password is the password for elasticsearch instance
-	Password string `yaml:"password"`
+	Password string `yaml:"password"  validate:"required"`
 	// IndexName is the name of the elasticsearch index
-	IndexName string `yaml:"index-name"`
+	IndexName string `yaml:"index-name"  validate:"required"`
+
+	HttpClient *retryablehttp.Client `yaml:"-"`
 }
 
 type data struct {
@@ -50,20 +55,23 @@ type Exporter struct {
 // New creates and returns a new exporter for elasticsearch
 func New(option *Options) (*Exporter, error) {
 	var ei *Exporter
-	err := validateOptions(option)
-	if err != nil {
-		return nil, err
+
+	var client *http.Client
+	if option.HttpClient != nil {
+		client = option.HttpClient.HTTPClient
+	} else {
+		client = &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        10,
+				MaxIdleConnsPerHost: 10,
+				DialContext:         protocolstate.Dialer.Dial,
+				DialTLSContext:      protocolstate.Dialer.DialTLS,
+				TLSClientConfig:     &tls.Config{InsecureSkipVerify: option.SSLVerification},
+			},
+		}
 	}
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        10,
-			MaxIdleConnsPerHost: 10,
-			DialContext:         protocolstate.Dialer.Dial,
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: option.SSLVerification},
-		},
-	}
 	// preparing url for elasticsearch
 	scheme := "http://"
 	if option.SSL {
@@ -76,7 +84,16 @@ func New(option *Options) (*Exporter, error) {
 		auth = "Basic " + auth
 		authentication = auth
 	}
-	url := fmt.Sprintf("%s%s:%d/%s/_doc", scheme, option.IP, option.Port, option.IndexName)
+	var addr string
+	if option.Host != "" {
+		addr = option.Host
+	} else {
+		addr = option.IP
+	}
+	if option.Port != 0 {
+		addr += fmt.Sprintf(":%d", option.Port)
+	}
+	url := fmt.Sprintf("%s%s/%s/_doc", scheme, addr, option.IndexName)
 
 	ei = &Exporter{
 		url:            url,
@@ -86,41 +103,17 @@ func New(option *Options) (*Exporter, error) {
 	return ei, nil
 }
 
-func validateOptions(options *Options) error {
-	errs := []string{}
-	if options.IP == "" {
-		errs = append(errs, "IP")
-	}
-	if options.Port == 0 {
-		errs = append(errs, "Port")
-	}
-	if options.Username == "" {
-		errs = append(errs, "Username")
-	}
-	if options.Password == "" {
-		errs = append(errs, "Password")
-	}
-	if options.IndexName == "" {
-		errs = append(errs, "IndexName")
-	}
-
-	if len(errs) > 0 {
-		return errors.New("Mandatory reporting configuration fields are missing: " + strings.Join(errs, ","))
-	}
-
-	return nil
-}
-
 // Export exports a passed result event to elasticsearch
-func (i *Exporter) Export(event *output.ResultEvent) error {
+func (exporter *Exporter) Export(event *output.ResultEvent) error {
 	// creating a request
-	req, err := http.NewRequest(http.MethodPost, i.url, nil)
+	req, err := http.NewRequest(http.MethodPost, exporter.url, nil)
 	if err != nil {
 		return errors.Wrap(err, "could not make request")
 	}
-	if len(i.authentication) > 0 {
-		req.Header.Add("Authorization", i.authentication)
+	if len(exporter.authentication) > 0 {
+		req.Header.Add("Authorization", exporter.authentication)
 	}
+	req.Header.Set("User-Agent", uarand.GetRandom())
 	req.Header.Add("Content-Type", "application/json")
 
 	d := data{
@@ -131,14 +124,14 @@ func (i *Exporter) Export(event *output.ResultEvent) error {
 	if err != nil {
 		return err
 	}
-	req.Body = ioutil.NopCloser(bytes.NewReader(b))
+	req.Body = io.NopCloser(bytes.NewReader(b))
 
-	res, err := i.elasticsearch.Do(req)
+	res, err := exporter.elasticsearch.Do(req)
 	if err != nil {
 		return err
 	}
 
-	b, err = ioutil.ReadAll(res.Body)
+	b, err = io.ReadAll(res.Body)
 	if err != nil {
 		return errors.New(err.Error() + "error thrown by elasticsearch " + string(b))
 	}
@@ -150,6 +143,6 @@ func (i *Exporter) Export(event *output.ResultEvent) error {
 }
 
 // Close closes the exporter after operation
-func (i *Exporter) Close() error {
+func (exporter *Exporter) Close() error {
 	return nil
 }

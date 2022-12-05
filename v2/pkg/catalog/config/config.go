@@ -5,18 +5,24 @@ import (
 	"path/filepath"
 
 	jsoniter "github.com/json-iterator/go"
+	"github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 
 	"github.com/projectdiscovery/gologger"
+	fileutil "github.com/projectdiscovery/utils/file"
 )
 
 // Config contains the internal nuclei engine configuration
 type Config struct {
 	TemplatesDirectory string `json:"nuclei-templates-directory,omitempty"`
-	TemplateVersion    string `json:"nuclei-templates-version,omitempty"`
-	NucleiVersion      string `json:"nuclei-version,omitempty"`
-	NucleiIgnoreHash   string `json:"nuclei-ignore-hash,omitempty"`
+
+	CustomS3TemplatesDirectory     string `json:"custom-s3-templates-directory"`
+	CustomGithubTemplatesDirectory string `json:"custom-github-templates-directory"`
+
+	TemplateVersion  string `json:"nuclei-templates-version,omitempty"`
+	NucleiVersion    string `json:"nuclei-version,omitempty"`
+	NucleiIgnoreHash string `json:"nuclei-ignore-hash,omitempty"`
 
 	NucleiLatestVersion          string `json:"nuclei-latest-version"`
 	NucleiTemplatesLatestVersion string `json:"nuclei-templates-latest-version"`
@@ -26,17 +32,41 @@ type Config struct {
 const nucleiConfigFilename = ".templates-config.json"
 
 // Version is the current version of nuclei
-const Version = `2.5.3`
+const Version = `2.8.0`
 
+var customConfigDirectory string
+
+func SetCustomConfigDirectory(dir string) {
+	customConfigDirectory = dir
+	if !fileutil.FolderExists(dir) {
+		_ = fileutil.CreateFolder(dir)
+	}
+}
 func getConfigDetails() (string, error) {
-	homeDir, err := os.UserHomeDir()
+	configDir, err := GetConfigDir()
 	if err != nil {
 		return "", errors.Wrap(err, "could not get home directory")
 	}
-	configDir := filepath.Join(homeDir, ".config", "nuclei")
-	_ = os.MkdirAll(configDir, os.ModePerm)
+	_ = os.MkdirAll(configDir, 0755)
 	templatesConfigFile := filepath.Join(configDir, nucleiConfigFilename)
 	return templatesConfigFile, nil
+}
+
+// GetConfigDir returns the nuclei configuration directory
+func GetConfigDir() (string, error) {
+	var (
+		home string
+		err  error
+	)
+	if customConfigDirectory != "" {
+		home = customConfigDirectory
+		return home, nil
+	}
+	home, err = homedir.Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "nuclei"), nil
 }
 
 // ReadConfiguration reads the nuclei configuration file from disk.
@@ -45,7 +75,6 @@ func ReadConfiguration() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	file, err := os.Open(templatesConfigFile)
 	if err != nil {
 		return nil, err
@@ -67,7 +96,7 @@ func WriteConfiguration(config *Config) error {
 	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(templatesConfigFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0777)
+	file, err := os.OpenFile(templatesConfigFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
@@ -90,7 +119,7 @@ type IgnoreFile struct {
 
 // ReadIgnoreFile reads the nuclei ignore file returning blocked tags and paths
 func ReadIgnoreFile() IgnoreFile {
-	file, err := os.Open(getIgnoreFilePath())
+	file, err := os.Open(GetIgnoreFilePath())
 	if err != nil {
 		gologger.Error().Msgf("Could not read nuclei-ignore file: %s\n", err)
 		return IgnoreFile{}
@@ -105,14 +134,41 @@ func ReadIgnoreFile() IgnoreFile {
 	return ignore
 }
 
-// getIgnoreFilePath returns the ignore file path for the runner
-func getIgnoreFilePath() string {
+var (
+	// customIgnoreFilePath contains a custom path for the ignore file
+	customIgnoreFilePath string
+	// ErrCustomIgnoreFilePathNotExist is raised when the ignore file doesn't exist in the custom path
+	ErrCustomIgnoreFilePathNotExist = errors.New("Ignore file doesn't exist in custom path")
+	// ErrCustomFolderNotExist is raised when the custom ignore folder doesn't exist
+	ErrCustomFolderNotExist = errors.New("The custom ignore path doesn't exist")
+)
+
+// OverrideIgnoreFilePath with a custom existing folder
+func OverrideIgnoreFilePath(customPath string) error {
+	// custom path does not exist
+	if !fileutil.FolderExists(customPath) {
+		return ErrCustomFolderNotExist
+	}
+	// ignore file within the custom path does not exist
+	if !fileutil.FileExists(filepath.Join(customPath, nucleiIgnoreFile)) {
+		return ErrCustomIgnoreFilePathNotExist
+	}
+	customIgnoreFilePath = customPath
+	return nil
+}
+
+// GetIgnoreFilePath returns the ignore file path for the runner
+func GetIgnoreFilePath() string {
 	var defIgnoreFilePath string
 
-	home, err := os.UserHomeDir()
+	if customIgnoreFilePath != "" {
+		defIgnoreFilePath = filepath.Join(customIgnoreFilePath, nucleiIgnoreFile)
+		return defIgnoreFilePath
+	}
+
+	configDir, err := GetConfigDir()
 	if err == nil {
-		configDir := filepath.Join(home, ".config", "nuclei")
-		_ = os.MkdirAll(configDir, os.ModePerm)
+		_ = os.MkdirAll(configDir, 0755)
 
 		defIgnoreFilePath = filepath.Join(configDir, nucleiIgnoreFile)
 		return defIgnoreFilePath

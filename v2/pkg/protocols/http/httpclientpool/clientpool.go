@@ -3,7 +3,6 @@ package httpclientpool
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/projectdiscovery/fastdialer/fastdialer"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/protocolstate"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/utils"
 	"github.com/projectdiscovery/nuclei/v2/pkg/types"
 	"github.com/projectdiscovery/rawhttp"
 	"github.com/projectdiscovery/retryablehttp-go"
@@ -28,10 +28,11 @@ var (
 	// Dialer is a copy of the fastdialer from protocolstate
 	Dialer *fastdialer.Dialer
 
-	rawhttpClient *rawhttp.Client
-	poolMutex     *sync.RWMutex
-	normalClient  *retryablehttp.Client
-	clientPool    map[string]*retryablehttp.Client
+	rawHttpClient     *rawhttp.Client
+	forceMaxRedirects int
+	poolMutex         *sync.RWMutex
+	normalClient      *retryablehttp.Client
+	clientPool        map[string]*retryablehttp.Client
 )
 
 // Init initializes the clientpool implementation
@@ -39,6 +40,9 @@ func Init(options *types.Options) error {
 	// Don't create clients if already created in the past.
 	if normalClient != nil {
 		return nil
+	}
+	if options.ShouldFollowHTTPRedirects() {
+		forceMaxRedirects = options.MaxRedirects
 	}
 	poolMutex = &sync.RWMutex{}
 	clientPool = make(map[string]*retryablehttp.Client)
@@ -55,6 +59,7 @@ func Init(options *types.Options) error {
 type ConnectionConfiguration struct {
 	// DisableKeepAlive of the connection
 	DisableKeepAlive bool
+	Cookiejar        *cookiejar.Jar
 }
 
 // Configuration contains the custom configuration options for a client
@@ -63,10 +68,12 @@ type Configuration struct {
 	Threads int
 	// MaxRedirects is the maximum number of redirects to follow
 	MaxRedirects int
+	// NoTimeout disables http request timeout for context based usage
+	NoTimeout bool
 	// CookieReuse enables cookie reuse for the http client (cookiejar impl)
 	CookieReuse bool
-	// FollowRedirects specifies whether to follow redirects
-	FollowRedirects bool
+	// FollowRedirects specifies the redirects flow
+	RedirectFlow RedirectFlow
 	// Connection defines custom connection configuration
 	Connection *ConnectionConfiguration
 }
@@ -79,8 +86,10 @@ func (c *Configuration) Hash() string {
 	builder.WriteString(strconv.Itoa(c.Threads))
 	builder.WriteString("m")
 	builder.WriteString(strconv.Itoa(c.MaxRedirects))
+	builder.WriteString("n")
+	builder.WriteString(strconv.FormatBool(c.NoTimeout))
 	builder.WriteString("f")
-	builder.WriteString(strconv.FormatBool(c.FollowRedirects))
+	builder.WriteString(strconv.Itoa(int(c.RedirectFlow)))
 	builder.WriteString("r")
 	builder.WriteString(strconv.FormatBool(c.CookieReuse))
 	builder.WriteString("c")
@@ -91,17 +100,24 @@ func (c *Configuration) Hash() string {
 
 // HasStandardOptions checks whether the configuration requires custom settings
 func (c *Configuration) HasStandardOptions() bool {
-	return c.Threads == 0 && c.MaxRedirects == 0 && !c.FollowRedirects && !c.CookieReuse && c.Connection == nil
+	return c.Threads == 0 && c.MaxRedirects == 0 && c.RedirectFlow == DontFollowRedirect && !c.CookieReuse && c.Connection == nil && !c.NoTimeout
 }
 
 // GetRawHTTP returns the rawhttp request client
 func GetRawHTTP(options *types.Options) *rawhttp.Client {
-	if rawhttpClient == nil {
-		rawhttpOptions := rawhttp.DefaultOptions
-		rawhttpOptions.Timeout = time.Duration(options.Timeout) * time.Second
-		rawhttpClient = rawhttp.NewClient(rawhttpOptions)
+	if rawHttpClient == nil {
+		rawHttpOptions := rawhttp.DefaultOptions
+		if types.ProxyURL != "" {
+			rawHttpOptions.Proxy = types.ProxyURL
+		} else if types.ProxySocksURL != "" {
+			rawHttpOptions.Proxy = types.ProxySocksURL
+		} else if Dialer != nil {
+			rawHttpOptions.FastDialer = Dialer
+		}
+		rawHttpOptions.Timeout = time.Duration(options.Timeout) * time.Second
+		rawHttpClient = rawhttp.NewClient(rawHttpOptions)
 	}
-	return rawhttpClient
+	return rawHttpClient
 }
 
 // Get creates or gets a client for the protocol based on custom configuration
@@ -114,7 +130,6 @@ func Get(options *types.Options, configuration *Configuration) (*retryablehttp.C
 
 // wrappedGet wraps a get operation without normal client check
 func wrappedGet(options *types.Options, configuration *Configuration) (*retryablehttp.Client, error) {
-	var proxyURL *url.URL
 	var err error
 
 	if Dialer == nil {
@@ -129,15 +144,8 @@ func wrappedGet(options *types.Options, configuration *Configuration) (*retryabl
 	}
 	poolMutex.RUnlock()
 
-	if options.ProxyURL != "" {
-		proxyURL, err = url.Parse(options.ProxyURL)
-	}
-	if err != nil {
-		return nil, err
-	}
-
 	// Multiple Host
-	retryablehttpOptions := retryablehttp.DefaultOptionsSpraying
+	retryableHttpOptions := retryablehttp.DefaultOptionsSpraying
 	disableKeepAlives := true
 	maxIdleConns := 0
 	maxConnsPerHost := 0
@@ -145,68 +153,113 @@ func wrappedGet(options *types.Options, configuration *Configuration) (*retryabl
 
 	if configuration.Threads > 0 {
 		// Single host
-		retryablehttpOptions = retryablehttp.DefaultOptionsSingle
+		retryableHttpOptions = retryablehttp.DefaultOptionsSingle
 		disableKeepAlives = false
 		maxIdleConnsPerHost = 500
 		maxConnsPerHost = 500
 	}
 
-	retryablehttpOptions.RetryWaitMax = 10 * time.Second
-	retryablehttpOptions.RetryMax = options.Retries
-	followRedirects := configuration.FollowRedirects
+	retryableHttpOptions.RetryWaitMax = 10 * time.Second
+	retryableHttpOptions.RetryMax = options.Retries
+	redirectFlow := configuration.RedirectFlow
 	maxRedirects := configuration.MaxRedirects
 
+	if forceMaxRedirects > 0 {
+		// by default we enable general redirects following
+		switch {
+		case options.FollowHostRedirects:
+			redirectFlow = FollowSameHostRedirect
+		default:
+			redirectFlow = FollowAllRedirect
+		}
+		maxRedirects = forceMaxRedirects
+	}
+	if options.DisableRedirects {
+		options.FollowRedirects = false
+		options.FollowHostRedirects = false
+		redirectFlow = DontFollowRedirect
+		maxRedirects = 0
+	}
 	// override connection's settings if required
 	if configuration.Connection != nil {
 		disableKeepAlives = configuration.Connection.DisableKeepAlive
 	}
 
+	// Set the base TLS configuration definition
+	tlsConfig := &tls.Config{
+		Renegotiation:      tls.RenegotiateOnceAsClient,
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS10,
+	}
+
+	if options.SNI != "" {
+		tlsConfig.ServerName = options.SNI
+	}
+
+	// Add the client certificate authentication to the request if it's configured
+	tlsConfig, err = utils.AddConfiguredClientCertToRequest(tlsConfig, options)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create client certificate")
+	}
+
 	transport := &http.Transport{
+		ForceAttemptHTTP2:   options.ForceAttemptHTTP2,
 		DialContext:         Dialer.Dial,
+		DialTLSContext:      Dialer.DialTLS,
 		MaxIdleConns:        maxIdleConns,
 		MaxIdleConnsPerHost: maxIdleConnsPerHost,
 		MaxConnsPerHost:     maxConnsPerHost,
-		TLSClientConfig: &tls.Config{
-			Renegotiation:      tls.RenegotiateOnceAsClient,
-			InsecureSkipVerify: true,
-		},
-		DisableKeepAlives: disableKeepAlives,
+		TLSClientConfig:     tlsConfig,
+		DisableKeepAlives:   disableKeepAlives,
 	}
 
-	// Attempts to overwrite the dial function with the socks proxied version
-	if options.ProxySocksURL != "" {
-		var proxyAuth *proxy.Auth
-
-		socksURL, proxyErr := url.Parse(options.ProxySocksURL)
-		if proxyErr == nil {
-			proxyAuth = &proxy.Auth{}
-			proxyAuth.User = socksURL.User.Username()
-			proxyAuth.Password, _ = socksURL.User.Password()
+	if types.ProxyURL != "" {
+		if proxyURL, err := url.Parse(types.ProxyURL); err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
 		}
-		dialer, proxyErr := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%s", socksURL.Hostname(), socksURL.Port()), proxyAuth, proxy.Direct)
+	} else if types.ProxySocksURL != "" {
+		socksURL, proxyErr := url.Parse(types.ProxySocksURL)
+		if proxyErr != nil {
+			return nil, proxyErr
+		}
+		dialer, err := proxy.FromURL(socksURL, proxy.Direct)
+		if err != nil {
+			return nil, err
+		}
+
 		dc := dialer.(interface {
 			DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 		})
 		if proxyErr == nil {
 			transport.DialContext = dc.DialContext
+			transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				// upgrade proxy connection to tls
+				conn, err := dc.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				return tls.Client(conn, tlsConfig), nil
+			}
 		}
-	}
-	if proxyURL != nil {
-		transport.Proxy = http.ProxyURL(proxyURL)
 	}
 
 	var jar *cookiejar.Jar
-	if configuration.CookieReuse {
+	if configuration.Connection != nil && configuration.Connection.Cookiejar != nil {
+		jar = configuration.Connection.Cookiejar
+	} else if configuration.CookieReuse {
 		if jar, err = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List}); err != nil {
 			return nil, errors.Wrap(err, "could not create cookiejar")
 		}
 	}
 
-	client := retryablehttp.NewWithHTTPClient(&http.Client{
+	httpclient := &http.Client{
 		Transport:     transport,
-		Timeout:       time.Duration(options.Timeout) * time.Second,
-		CheckRedirect: makeCheckRedirectFunc(followRedirects, maxRedirects),
-	}, retryablehttpOptions)
+		CheckRedirect: makeCheckRedirectFunc(redirectFlow, maxRedirects),
+	}
+	if !configuration.NoTimeout {
+		httpclient.Timeout = time.Duration(options.Timeout) * time.Second
+	}
+	client := retryablehttp.NewWithHTTPClient(httpclient, retryableHttpOptions)
 	if jar != nil {
 		client.HTTPClient.Jar = jar
 	}
@@ -221,26 +274,51 @@ func wrappedGet(options *types.Options, configuration *Configuration) (*retryabl
 	return client, nil
 }
 
+type RedirectFlow uint8
+
+const (
+	DontFollowRedirect RedirectFlow = iota
+	FollowSameHostRedirect
+	FollowAllRedirect
+)
+
 const defaultMaxRedirects = 10
 
 type checkRedirectFunc func(req *http.Request, via []*http.Request) error
 
-func makeCheckRedirectFunc(followRedirects bool, maxRedirects int) checkRedirectFunc {
+func makeCheckRedirectFunc(redirectType RedirectFlow, maxRedirects int) checkRedirectFunc {
 	return func(req *http.Request, via []*http.Request) error {
-		if !followRedirects {
+		switch redirectType {
+		case DontFollowRedirect:
 			return http.ErrUseLastResponse
-		}
-
-		if maxRedirects == 0 {
-			if len(via) > defaultMaxRedirects {
+		case FollowSameHostRedirect:
+			var newHost = req.URL.Host
+			var oldHost = via[0].Host
+			if oldHost == "" {
+				oldHost = via[0].URL.Host
+			}
+			if newHost != oldHost {
+				// Tell the http client to not follow redirect
 				return http.ErrUseLastResponse
 			}
-			return nil
+			return checkMaxRedirects(req, via, maxRedirects)
+		case FollowAllRedirect:
+			return checkMaxRedirects(req, via, maxRedirects)
 		}
+		return nil
+	}
+}
 
-		if len(via) > maxRedirects {
+func checkMaxRedirects(req *http.Request, via []*http.Request, maxRedirects int) error {
+	if maxRedirects == 0 {
+		if len(via) > defaultMaxRedirects {
 			return http.ErrUseLastResponse
 		}
 		return nil
 	}
+
+	if len(via) > maxRedirects {
+		return http.ErrUseLastResponse
+	}
+	return nil
 }

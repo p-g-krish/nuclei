@@ -12,13 +12,14 @@ import (
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/helpers/responsehighlighter"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/utils"
 	"github.com/projectdiscovery/nuclei/v2/pkg/types"
 )
 
 // Match matches a generic data response again a given matcher
 func (request *Request) Match(data map[string]interface{}, matcher *matchers.Matcher) (bool, []string) {
 	item, ok := getMatchPart(matcher.Part, data)
-	if !ok {
+	if !ok && matcher.Type.MatcherType != matchers.DSLMatcher {
 		return false, []string{}
 	}
 
@@ -58,7 +59,7 @@ func getStatusCode(data map[string]interface{}) (int, bool) {
 // Extract performs extracting operation for an extractor on model and returns true or false.
 func (request *Request) Extract(data map[string]interface{}, extractor *extractors.Extractor) map[string]struct{} {
 	item, ok := getMatchPart(extractor.Part, data)
-	if !ok {
+	if !ok && !extractors.SupportsMap(extractor) {
 		return nil
 	}
 	switch extractor.GetType() {
@@ -66,6 +67,8 @@ func (request *Request) Extract(data map[string]interface{}, extractor *extracto
 		return extractor.ExtractRegex(item)
 	case extractors.KValExtractor:
 		return extractor.ExtractKval(data)
+	case extractors.DSLExtractor:
+		return extractor.ExtractDSL(data)
 	}
 	return nil
 }
@@ -110,14 +113,16 @@ func (request *Request) responseToDSLMap(resp *http.Response, host, matched, raw
 	data["matched"] = matched
 	data["request"] = rawReq
 	data["response"] = rawResp
-	data["content_length"] = resp.ContentLength
 	data["status_code"] = resp.StatusCode
 	data["body"] = body
+	data["type"] = request.Type().String()
 	data["all_headers"] = headers
 	data["duration"] = duration.Seconds()
 	data["template-id"] = request.options.TemplateID
 	data["template-info"] = request.options.TemplateInfo
 	data["template-path"] = request.options.TemplatePath
+	data["content_length"] = utils.CalculateContentLength(resp.ContentLength, int64(len(body)))
+
 	return data
 }
 
@@ -135,11 +140,12 @@ func (request *Request) MakeResultEventItem(wrapped *output.InternalWrappedEvent
 		TemplateID:       types.ToString(wrapped.InternalEvent["template-id"]),
 		TemplatePath:     types.ToString(wrapped.InternalEvent["template-path"]),
 		Info:             wrapped.InternalEvent["template-info"].(model.Info),
-		Type:             "http",
+		Type:             types.ToString(wrapped.InternalEvent["type"]),
 		Path:             types.ToString(wrapped.InternalEvent["path"]),
 		Matched:          types.ToString(wrapped.InternalEvent["matched"]),
 		Metadata:         wrapped.OperatorsResult.PayloadValues,
 		ExtractedResults: wrapped.OperatorsResult.OutputExtracts,
+		MatcherStatus:    true,
 		IP:               types.ToString(wrapped.InternalEvent["ip"]),
 		Request:          types.ToString(wrapped.InternalEvent["request"]),
 		Response:         types.ToString(wrapped.InternalEvent["raw"]),

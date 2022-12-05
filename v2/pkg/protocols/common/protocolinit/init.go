@@ -2,10 +2,13 @@ package protocolinit
 
 import (
 	"github.com/corpix/uarand"
+
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/protocolstate"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/dns/dnsclientpool"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/http/httpclientpool"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/http/signerpool"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/network/networkclientpool"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/whois/rdapclientpool"
 	"github.com/projectdiscovery/nuclei/v2/pkg/types"
 )
 
@@ -22,7 +25,16 @@ func Init(options *types.Options) error {
 	if err := httpclientpool.Init(options); err != nil {
 		return err
 	}
-	return networkclientpool.Init(options)
+	if err := signerpool.Init(options); err != nil {
+		return err
+	}
+	if err := networkclientpool.Init(options); err != nil {
+		return err
+	}
+	if err := rdapclientpool.Init(options); err != nil {
+		return err
+	}
+	return nil
 }
 
 var userAgents = []string{

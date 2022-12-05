@@ -14,23 +14,16 @@ import (
 
 // Match matches a generic data response again a given matcher
 func (request *Request) Match(data map[string]interface{}, matcher *matchers.Matcher) (bool, []string) {
-	partString := matcher.Part
-	switch partString {
-	case "body", "all", "":
-		partString = "data"
-	}
-
-	item, ok := data[partString]
-	if !ok {
+	itemStr, ok := request.getMatchPart(matcher.Part, data)
+	if !ok && matcher.Type.MatcherType != matchers.DSLMatcher {
 		return false, []string{}
 	}
-	itemStr := types.ToString(item)
 
 	switch matcher.GetType() {
 	case matchers.SizeMatcher:
 		return matcher.Result(matcher.MatchSize(len(itemStr))), []string{}
 	case matchers.WordsMatcher:
-		return matcher.ResultWithMatchedSnippet(matcher.MatchWords(itemStr, request.dynamicValues))
+		return matcher.ResultWithMatchedSnippet(matcher.MatchWords(itemStr, data))
 	case matchers.RegexMatcher:
 		return matcher.ResultWithMatchedSnippet(matcher.MatchRegex(itemStr))
 	case matchers.BinaryMatcher:
@@ -43,25 +36,35 @@ func (request *Request) Match(data map[string]interface{}, matcher *matchers.Mat
 
 // Extract performs extracting operation for an extractor on model and returns true or false.
 func (request *Request) Extract(data map[string]interface{}, extractor *extractors.Extractor) map[string]struct{} {
-	partString := extractor.Part
-	switch partString {
-	case "body", "all", "":
-		partString = "data"
-	}
-
-	item, ok := data[partString]
-	if !ok {
+	itemStr, ok := request.getMatchPart(extractor.Part, data)
+	if !ok && !extractors.SupportsMap(extractor) {
 		return nil
 	}
-	itemStr := types.ToString(item)
 
 	switch extractor.GetType() {
 	case extractors.RegexExtractor:
 		return extractor.ExtractRegex(itemStr)
 	case extractors.KValExtractor:
 		return extractor.ExtractKval(data)
+	case extractors.DSLExtractor:
+		return extractor.ExtractDSL(data)
 	}
 	return nil
+}
+
+func (request *Request) getMatchPart(part string, data output.InternalEvent) (string, bool) {
+	switch part {
+	case "body", "all", "":
+		part = "data"
+	}
+
+	item, ok := data[part]
+	if !ok {
+		return "", false
+	}
+	itemStr := types.ToString(item)
+
+	return itemStr, true
 }
 
 // responseToDSLMap converts a network response to a map for use in DSL matching
@@ -72,6 +75,7 @@ func (request *Request) responseToDSLMap(req, resp, raw, host, matched string) o
 		"request":       req,
 		"data":          resp, // Data is the last bytes read
 		"raw":           raw,  // Raw is the full transaction data for network
+		"type":          request.Type().String(),
 		"template-id":   request.options.TemplateID,
 		"template-info": request.options.TemplateInfo,
 		"template-path": request.options.TemplatePath,
@@ -92,12 +96,13 @@ func (request *Request) MakeResultEventItem(wrapped *output.InternalWrappedEvent
 		TemplateID:       types.ToString(wrapped.InternalEvent["template-id"]),
 		TemplatePath:     types.ToString(wrapped.InternalEvent["template-path"]),
 		Info:             wrapped.InternalEvent["template-info"].(model.Info),
-		Type:             "network",
+		Type:             types.ToString(wrapped.InternalEvent["type"]),
 		Host:             types.ToString(wrapped.InternalEvent["host"]),
 		Matched:          types.ToString(wrapped.InternalEvent["matched"]),
 		ExtractedResults: wrapped.OperatorsResult.OutputExtracts,
 		Metadata:         wrapped.OperatorsResult.PayloadValues,
 		Timestamp:        time.Now(),
+		MatcherStatus:    true,
 		IP:               types.ToString(wrapped.InternalEvent["ip"]),
 		Request:          types.ToString(wrapped.InternalEvent["request"]),
 		Response:         types.ToString(wrapped.InternalEvent["data"]),

@@ -5,11 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
-	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -17,27 +15,36 @@ import (
 	"github.com/corpix/uarand"
 	"github.com/pkg/errors"
 
+	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/expressions"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/generators"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/replacer"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/utils/vardump"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/http/race"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/http/raw"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/http/utils"
 	"github.com/projectdiscovery/nuclei/v2/pkg/types"
 	"github.com/projectdiscovery/rawhttp"
 	"github.com/projectdiscovery/retryablehttp-go"
+	stringsutil "github.com/projectdiscovery/utils/strings"
 )
 
 var (
 	urlWithPortRegex = regexp.MustCompile(`{{BaseURL}}:(\d+)`)
 )
 
+const evaluateHelperExpressionErrorMessage = "could not evaluate helper expressions"
+
 // generatedRequest is a single generated request wrapped for a template request
 type generatedRequest struct {
-	original        *Request
-	rawRequest      *raw.Request
-	meta            map[string]interface{}
-	pipelinedClient *rawhttp.PipelineClient
-	request         *retryablehttp.Request
-	dynamicValues   map[string]interface{}
+	original             *Request
+	rawRequest           *raw.Request
+	meta                 map[string]interface{}
+	pipelinedClient      *rawhttp.PipelineClient
+	request              *retryablehttp.Request
+	dynamicValues        map[string]interface{}
+	interactshURLs       []string
+	customCancelFunction context.CancelFunc
 }
 
 func (g *generatedRequest) URL() string {
@@ -52,22 +59,18 @@ func (g *generatedRequest) URL() string {
 
 // Make creates a http request for the provided input.
 // It returns io.EOF as error when all the requests have been exhausted.
-func (r *requestGenerator) Make(baseURL string, dynamicValues map[string]interface{}, interactURL string) (*generatedRequest, error) {
+func (r *requestGenerator) Make(ctx context.Context, baseURL, data string, payloads, dynamicValues map[string]interface{}) (*generatedRequest, error) {
 	if r.request.SelfContained {
-		return r.makeSelfContainedRequest(dynamicValues, interactURL)
+		return r.makeSelfContainedRequest(ctx, data, payloads, dynamicValues)
 	}
-	// We get the next payload for the request.
-	data, payloads, ok := r.nextValue()
-	if !ok {
-		return nil, io.EOF
-	}
-	ctx := context.Background()
-
-	if interactURL != "" {
-		data = r.options.Interactsh.ReplaceMarkers(data, interactURL)
-
+	if r.options.Interactsh != nil {
+		data, r.interactshURLs = r.options.Interactsh.ReplaceMarkers(data, []string{})
 		for payloadName, payloadValue := range payloads {
-			payloads[payloadName] = r.options.Interactsh.ReplaceMarkers(types.ToString(payloadValue), interactURL)
+			payloads[payloadName], r.interactshURLs = r.options.Interactsh.ReplaceMarkers(types.ToString(payloadValue), r.interactshURLs)
+		}
+	} else {
+		for payloadName, payloadValue := range payloads {
+			payloads[payloadName] = types.ToString(payloadValue)
 		}
 	}
 
@@ -91,26 +94,22 @@ func (r *requestGenerator) Make(baseURL string, dynamicValues map[string]interfa
 	}
 
 	values := generators.MergeMaps(
-		generators.MergeMaps(dynamicValues, generateVariables(parsed, trailingSlash)),
+		generators.MergeMaps(dynamicValues, utils.GenerateVariables(parsed, trailingSlash)),
 		generators.BuildPayloadFromOptions(r.request.options.Options),
 	)
+	if vardump.EnableVarDump {
+		gologger.Debug().Msgf("Protocol request variables: \n%s\n", vardump.DumpVariables(values))
+	}
 
 	// If data contains \n it's a raw request, process it like raw. Else
 	// continue with the template based request flow.
 	if isRawRequest {
-		return r.makeHTTPRequestFromRaw(ctx, parsed.String(), data, values, payloads, interactURL)
+		return r.makeHTTPRequestFromRaw(ctx, parsed.String(), data, values, payloads)
 	}
-	return r.makeHTTPRequestFromModel(ctx, data, values, payloads, interactURL)
+	return r.makeHTTPRequestFromModel(ctx, data, values, payloads)
 }
 
-func (r *requestGenerator) makeSelfContainedRequest(dynamicValues map[string]interface{}, interactURL string) (*generatedRequest, error) {
-	// We get the next payload for the request.
-	data, payloads, ok := r.nextValue()
-	if !ok {
-		return nil, io.EOF
-	}
-	ctx := context.Background()
-
+func (r *requestGenerator) makeSelfContainedRequest(ctx context.Context, data string, payloads, dynamicValues map[string]interface{}) (*generatedRequest, error) {
 	isRawRequest := r.request.isRaw()
 
 	// If the request is a raw request, get the URL from the request
@@ -118,31 +117,63 @@ func (r *requestGenerator) makeSelfContainedRequest(dynamicValues map[string]int
 	if isRawRequest {
 		// Get the hostname from the URL section to build the request.
 		reader := bufio.NewReader(strings.NewReader(data))
+	read_line:
 		s, err := reader.ReadString('\n')
 		if err != nil {
-			return nil, fmt.Errorf("could not read request: %s", err)
+			return nil, fmt.Errorf("could not read request: %w", err)
+		}
+		// ignore all annotations
+		if stringsutil.HasPrefixAny(s, "@") {
+			goto read_line
 		}
 
 		parts := strings.Split(s, " ")
 		if len(parts) < 3 {
 			return nil, fmt.Errorf("malformed request supplied")
 		}
-		parsed, err := url.Parse(parts[1])
-		if err != nil {
-			return nil, fmt.Errorf("could not parse request URL: %s", err)
-		}
+
 		values := generators.MergeMaps(
-			generators.MergeMaps(dynamicValues, generateVariables(parsed, false)),
+			payloads,
 			generators.BuildPayloadFromOptions(r.request.options.Options),
 		)
 
-		return r.makeHTTPRequestFromRaw(ctx, parsed.String(), data, values, payloads, interactURL)
+		// in case cases (eg requests signing, some variables uses default values if missing)
+		if defaultList := GetVariablesDefault(r.request.Signature.Value); defaultList != nil {
+			values = generators.MergeMaps(defaultList, values)
+		}
+
+		parts[1] = replacer.Replace(parts[1], values)
+		if len(dynamicValues) > 0 {
+			parts[1] = replacer.Replace(parts[1], dynamicValues)
+		}
+
+		// the url might contain placeholders with ignore list
+		if ignoreList := GetVariablesNamesSkipList(r.request.Signature.Value); ignoreList != nil {
+			if err := expressions.ContainsVariablesWithIgnoreList(ignoreList, parts[1]); err != nil {
+				return nil, err
+			}
+		} else { // the url might contain placeholders
+			if err := expressions.ContainsUnresolvedVariables(parts[1]); err != nil {
+				return nil, err
+			}
+		}
+
+		parsed, err := url.Parse(parts[1])
+		if err != nil {
+			return nil, fmt.Errorf("could not parse request URL: %w", err)
+		}
+		values = generators.MergeMaps(
+			generators.MergeMaps(dynamicValues, utils.GenerateVariables(parsed, false)),
+			values,
+		)
+
+		return r.makeHTTPRequestFromRaw(ctx, parsed.String(), data, values, payloads)
 	}
 	values := generators.MergeMaps(
 		dynamicValues,
 		generators.BuildPayloadFromOptions(r.request.options.Options),
 	)
-	return r.makeHTTPRequestFromModel(ctx, data, values, payloads, interactURL)
+	return r.makeHTTPRequestFromModel(ctx, data, values, payloads)
 }
 
 // Total returns the total number of requests for the generator
@@ -171,9 +202,9 @@ func baseURLWithTemplatePrefs(data string, parsed *url.URL) (string, *url.URL) {
 }
 
 // MakeHTTPRequestFromModel creates a *http.Request from a request template
-func (r *requestGenerator) makeHTTPRequestFromModel(ctx context.Context, data string, values, generatorValues map[string]interface{}, interactURL string) (*generatedRequest, error) {
-	if interactURL != "" {
-		data = r.options.Interactsh.ReplaceMarkers(data, interactURL)
+func (r *requestGenerator) makeHTTPRequestFromModel(ctx context.Context, data string, values, generatorValues map[string]interface{}) (*generatedRequest, error) {
+	if r.options.Interactsh != nil {
+		data, r.interactshURLs = r.options.Interactsh.ReplaceMarkers(data, r.interactshURLs)
 	}
 
 	// Combine the template payloads along with base
@@ -184,12 +215,12 @@ func (r *requestGenerator) makeHTTPRequestFromModel(ctx context.Context, data st
 	var err error
 	data, err = expressions.Evaluate(data, finalValues)
 	if err != nil {
-		return nil, errors.Wrap(err, "could not evaluate helper expressions")
+		return nil, errors.Wrap(err, evaluateHelperExpressionErrorMessage)
 	}
 
-	method, err := expressions.Evaluate(r.request.Method, finalValues)
+	method, err := expressions.Evaluate(r.request.Method.String(), finalValues)
 	if err != nil {
-		return nil, errors.Wrap(err, "could not evaluate helper expressions")
+		return nil, errors.Wrap(err, evaluateHelperExpressionErrorMessage)
 	}
 
 	// Build a request on the specified URL
@@ -198,17 +229,17 @@ func (r *requestGenerator) makeHTTPRequestFromModel(ctx context.Context, data st
 		return nil, err
 	}
 
-	request, err := r.fillRequest(req, finalValues, interactURL)
+	request, err := r.fillRequest(req, finalValues)
 	if err != nil {
 		return nil, err
 	}
-	return &generatedRequest{request: request, meta: generatorValues, original: r.request, dynamicValues: finalValues}, nil
+	return &generatedRequest{request: request, meta: generatorValues, original: r.request, dynamicValues: finalValues, interactshURLs: r.interactshURLs}, nil
 }
 
 // makeHTTPRequestFromRaw creates a *http.Request from a raw request
-func (r *requestGenerator) makeHTTPRequestFromRaw(ctx context.Context, baseURL, data string, values, payloads map[string]interface{}, interactURL string) (*generatedRequest, error) {
-	if interactURL != "" {
-		data = r.options.Interactsh.ReplaceMarkers(data, interactURL)
+func (r *requestGenerator) makeHTTPRequestFromRaw(ctx context.Context, baseURL, data string, values, payloads map[string]interface{}) (*generatedRequest, error) {
+	if r.options.Interactsh != nil {
+		data, r.interactshURLs = r.options.Interactsh.ReplaceMarkers(data, r.interactshURLs)
 	}
 	return r.handleRawWithPayloads(ctx, data, baseURL, values, payloads)
 }
@@ -223,7 +254,7 @@ func (r *requestGenerator) handleRawWithPayloads(ctx context.Context, rawRequest
 	var err error
 	rawRequest, err = expressions.Evaluate(rawRequest, finalValues)
 	if err != nil {
-		return nil, errors.Wrap(err, "could not evaluate helper expressions")
+		return nil, errors.Wrap(err, evaluateHelperExpressionErrorMessage)
 	}
 	rawRequestData, err := raw.Parse(rawRequest, baseURL, r.request.Unsafe)
 	if err != nil {
@@ -232,13 +263,16 @@ func (r *requestGenerator) handleRawWithPayloads(ctx context.Context, rawRequest
 
 	// Unsafe option uses rawhttp library
 	if r.request.Unsafe {
-		unsafeReq := &generatedRequest{rawRequest: rawRequestData, meta: generatorValues, original: r.request}
+		if len(r.options.Options.CustomHeaders) > 0 {
+			_ = rawRequestData.TryFillCustomHeaders(r.options.Options.CustomHeaders)
+		}
+		unsafeReq := &generatedRequest{rawRequest: rawRequestData, meta: generatorValues, original: r.request, interactshURLs: r.interactshURLs}
 		return unsafeReq, nil
 	}
 
 	// retryablehttp
 	var body io.ReadCloser
-	body = ioutil.NopCloser(strings.NewReader(rawRequestData.Data))
+	body = io.NopCloser(strings.NewReader(rawRequestData.Data))
 	if r.request.Race {
 		// More or less this ensures that all requests hit the endpoint at the same approximated time
 		// Todo: sync internally upon writing latest request byte
@@ -258,24 +292,37 @@ func (r *requestGenerator) handleRawWithPayloads(ctx context.Context, rawRequest
 			req.Host = value
 		}
 	}
-	request, err := r.fillRequest(req, finalValues, "")
+	request, err := r.fillRequest(req, finalValues)
 	if err != nil {
 		return nil, err
 	}
 
-	return &generatedRequest{request: request, meta: generatorValues, original: r.request, dynamicValues: finalValues}, nil
+	generatedRequest := &generatedRequest{
+		request:        request,
+		meta:           generatorValues,
+		original:       r.request,
+		dynamicValues:  finalValues,
+		interactshURLs: r.interactshURLs,
+	}
+
+	if reqWithAnnotations, cancelFunc, hasAnnotations := r.request.parseAnnotations(rawRequest, req); hasAnnotations {
+		generatedRequest.request.Request = reqWithAnnotations
+		generatedRequest.customCancelFunction = cancelFunc
+	}
+
+	return generatedRequest, nil
 }
 
 // fillRequest fills various headers in the request with values
-func (r *requestGenerator) fillRequest(req *http.Request, values map[string]interface{}, interactURL string) (*retryablehttp.Request, error) {
+func (r *requestGenerator) fillRequest(req *http.Request, values map[string]interface{}) (*retryablehttp.Request, error) {
 	// Set the header values requested
 	for header, value := range r.request.Headers {
-		if interactURL != "" {
-			value = r.options.Interactsh.ReplaceMarkers(value, interactURL)
+		if r.options.Interactsh != nil {
+			value, r.interactshURLs = r.options.Interactsh.ReplaceMarkers(value, r.interactshURLs)
 		}
 		value, err := expressions.Evaluate(value, values)
 		if err != nil {
-			return nil, errors.Wrap(err, "could not evaluate helper expressions")
+			return nil, errors.Wrap(err, evaluateHelperExpressionErrorMessage)
 		}
 		req.Header[header] = []string{value}
 		if header == "Host" {
@@ -291,23 +338,48 @@ func (r *requestGenerator) fillRequest(req *http.Request, values map[string]inte
 	// Check if the user requested a request body
 	if r.request.Body != "" {
 		body := r.request.Body
-		if interactURL != "" {
-			body = r.options.Interactsh.ReplaceMarkers(body, interactURL)
+		if r.options.Interactsh != nil {
+			body, r.interactshURLs = r.options.Interactsh.ReplaceMarkers(r.request.Body, r.interactshURLs)
 		}
 		body, err := expressions.Evaluate(body, values)
 		if err != nil {
-			return nil, errors.Wrap(err, "could not evaluate helper expressions")
+			return nil, errors.Wrap(err, evaluateHelperExpressionErrorMessage)
 		}
-		req.Body = ioutil.NopCloser(strings.NewReader(body))
+		req.Body = io.NopCloser(strings.NewReader(body))
 	}
-	setHeader(req, "User-Agent", uarand.GetRandom())
+	if !r.request.Unsafe {
+		setHeader(req, "User-Agent", uarand.GetRandom())
+	}
 
 	// Only set these headers on non-raw requests
-	if len(r.request.Raw) == 0 {
+	if len(r.request.Raw) == 0 && !r.request.Unsafe {
 		setHeader(req, "Accept", "*/*")
 		setHeader(req, "Accept-Language", "en")
 	}
-	return retryablehttp.FromRequest(req)
+
+	if !LeaveDefaultPorts {
+		switch {
+		case req.URL.Scheme == "http" && strings.HasSuffix(req.Host, ":80"):
+			req.Host = strings.TrimSuffix(req.Host, ":80")
+		case req.URL.Scheme == "https" && strings.HasSuffix(req.Host, ":443"):
+			req.Host = strings.TrimSuffix(req.Host, ":443")
+		}
+	}
+
+	filledRequest, err := retryablehttp.FromRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if r.request.DigestAuthUsername != "" {
+		filledRequest.Auth = &retryablehttp.Auth{
+			Type:     retryablehttp.DigestAuth,
+			Username: r.request.DigestAuthUsername,
+			Password: r.request.DigestAuthPassword,
+		}
+	}
+
+	return filledRequest, nil
 }
 
 // setHeader sets some headers only if the header wasn't supplied by the user
@@ -317,46 +389,5 @@ func setHeader(req *http.Request, name, value string) {
 	}
 	if name == "Host" {
 		req.Host = value
-	}
-}
-
-// generateVariables will create default variables after parsing a url
-func generateVariables(parsed *url.URL, trailingSlash bool) map[string]interface{} {
-	domain := parsed.Host
-	if strings.Contains(parsed.Host, ":") {
-		domain = strings.Split(parsed.Host, ":")[0]
-	}
-
-	port := parsed.Port()
-	if port == "" {
-		if parsed.Scheme == "https" {
-			port = "443"
-		} else if parsed.Scheme == "http" {
-			port = "80"
-		}
-	}
-
-	if trailingSlash {
-		parsed.Path = strings.TrimSuffix(parsed.Path, "/")
-	}
-
-	escapedPath := parsed.EscapedPath()
-	directory := path.Dir(escapedPath)
-	if directory == "." {
-		directory = ""
-	}
-	base := path.Base(escapedPath)
-	if base == "." {
-		base = ""
-	}
-	return map[string]interface{}{
-		"BaseURL":  parsed.String(),
-		"RootURL":  fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host),
-		"Hostname": parsed.Host,
-		"Host":     domain,
-		"Port":     port,
-		"Path":     directory,
-		"File":     base,
-		"Scheme":   parsed.Scheme,
 	}
 }

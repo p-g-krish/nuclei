@@ -1,6 +1,7 @@
 package severity
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -12,7 +13,7 @@ import (
 type Severities []Severity
 
 func (severities *Severities) Set(values string) error {
-	inputSeverities, err := goflags.ToNormalizedStringSlice(values)
+	inputSeverities, err := goflags.ToStringSlice(values, goflags.FileNormalizedStringSliceOptions)
 	if err != nil {
 		return err
 	}
@@ -42,8 +43,25 @@ func (severities *Severities) UnmarshalYAML(unmarshal func(interface{}) error) e
 	return nil
 }
 
+func (severities *Severities) UnmarshalJSON(data []byte) error {
+	var stringSliceValue stringslice.StringSlice
+	if err := json.Unmarshal(data, &stringSliceValue); err != nil {
+		return err
+	}
+
+	stringSLice := stringSliceValue.ToSlice()
+	var result = make(Severities, 0, len(stringSLice))
+	for _, severityString := range stringSLice {
+		if err := setSeverity(&result, severityString); err != nil {
+			return err
+		}
+	}
+	*severities = result
+	return nil
+}
+
 func (severities Severities) String() string {
-	var stringSeverities []string
+	var stringSeverities = make([]string, 0, len(severities))
 	for _, severity := range severities {
 		stringSeverities = append(stringSeverities, severity.String())
 	}

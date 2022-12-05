@@ -15,17 +15,27 @@ type workflowLoader struct {
 
 // NewLoader returns a new workflow loader structure
 func NewLoader(options *protocols.ExecuterOptions) (model.WorkflowLoader, error) {
-	tagFilter := filter.New(&filter.Config{
-		Tags:        options.Options.Tags,
-		ExcludeTags: options.Options.ExcludeTags,
-		Authors:     options.Options.Author,
-		Severities:  options.Options.Severities,
-		IncludeTags: options.Options.IncludeTags,
+	tagFilter, err := filter.New(&filter.Config{
+		Authors:           options.Options.Authors,
+		Tags:              options.Options.Tags,
+		ExcludeTags:       options.Options.ExcludeTags,
+		IncludeTags:       options.Options.IncludeTags,
+		IncludeIds:        options.Options.IncludeIds,
+		ExcludeIds:        options.Options.ExcludeIds,
+		Severities:        options.Options.Severities,
+		ExcludeSeverities: options.Options.ExcludeSeverities,
+		Protocols:         options.Options.Protocols,
+		ExcludeProtocols:  options.Options.ExcludeProtocols,
+		IncludeConditions: options.Options.IncludeConditions,
 	})
+	if err != nil {
+		return nil, err
+	}
 	pathFilter := filter.NewPathFilter(&filter.PathFilterConfig{
 		IncludedTemplates: options.Options.IncludeTemplates,
 		ExcludedTemplates: options.Options.ExcludedTemplates,
 	}, options.Catalog)
+
 	return &workflowLoader{pathFilter: pathFilter, tagFilter: tagFilter, options: options}, nil
 }
 
@@ -35,7 +45,7 @@ func (w *workflowLoader) GetTemplatePathsByTags(templateTags []string) []string 
 
 	loadedTemplates := make([]string, 0, len(templatePathMap))
 	for templatePath := range templatePathMap {
-		loaded, err := LoadTemplate(templatePath, w.tagFilter, templateTags)
+		loaded, err := LoadTemplate(templatePath, w.tagFilter, templateTags, w.options.Catalog)
 		if err != nil {
 			gologger.Warning().Msgf("Could not load template %s: %s\n", templatePath, err)
 		} else if loaded {
@@ -51,7 +61,7 @@ func (w *workflowLoader) GetTemplatePaths(templatesList []string, noValidate boo
 
 	loadedTemplates := make([]string, 0, len(templatesPathMap))
 	for templatePath := range templatesPathMap {
-		matched, err := LoadTemplate(templatePath, w.tagFilter, nil)
+		matched, err := LoadTemplate(templatePath, w.tagFilter, nil, w.options.Catalog)
 		if err != nil {
 			gologger.Warning().Msgf("Could not load template %s: %s\n", templatePath, err)
 		} else if matched || noValidate {

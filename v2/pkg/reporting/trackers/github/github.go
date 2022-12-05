@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -13,6 +14,8 @@ import (
 
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
 	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/format"
+	"github.com/projectdiscovery/nuclei/v2/pkg/types"
+	"github.com/projectdiscovery/retryablehttp-go"
 )
 
 // Integration is a client for an issue tracker integration
@@ -21,36 +24,42 @@ type Integration struct {
 	options *Options
 }
 
-// Options contains the configuration options for github issue tracker client
+// Options contains the configuration options for GitHub issue tracker client
 type Options struct {
-	// BaseURL (optional) is the self-hosted github application url
-	BaseURL string `yaml:"base-url"`
+	// BaseURL (optional) is the self-hosted GitHub application url
+	BaseURL string `yaml:"base-url" validate:"omitempty,url"`
 	// Username is the username of the github user
-	Username string `yaml:"username"`
-	// Owner (manadatory) is the owner name of the repository for issues.
-	Owner string `yaml:"owner"`
-	// Token is the token for github account.
-	Token string `yaml:"token"`
+	Username string `yaml:"username" validate:"required"`
+	// Owner is the owner name of the repository for issues.
+	Owner string `yaml:"owner" validate:"required"`
+	// Token is the token for GitHub account.
+	Token string `yaml:"token" validate:"required"`
 	// ProjectName is the name of the repository.
-	ProjectName string `yaml:"project-name"`
+	ProjectName string `yaml:"project-name" validate:"required"`
 	// IssueLabel (optional) is the label of the created issue type
 	IssueLabel string `yaml:"issue-label"`
 	// SeverityAsLabel (optional) sends the severity as the label of the created
 	// issue.
 	SeverityAsLabel bool `yaml:"severity-as-label"`
+
+	HttpClient *retryablehttp.Client `yaml:"-"`
 }
 
 // New creates a new issue tracker integration client based on options.
 func New(options *Options) (*Integration, error) {
-	err := validateOptions(options)
-	if err != nil {
-		return nil, err
-	}
 	ctx := context.Background()
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: options.Token},
 	)
 	tc := oauth2.NewClient(ctx, ts)
+
+	// patch transport to support proxy - only http
+	// TODO: investigate if it's possible to reuse existing retryablehttp
+	if types.ProxyURL != "" {
+		if proxyURL, err := url.Parse(types.ProxyURL); err == nil {
+			tc.Transport.(*http.Transport).Proxy = http.ProxyURL(proxyURL)
+		}
+	}
 
 	client := github.NewClient(tc)
 	if options.BaseURL != "" {
@@ -58,31 +67,12 @@ func New(options *Options) (*Integration, error) {
 		if err != nil {
 			return nil, errors.Wrap(err, "could not parse custom baseurl")
 		}
+		if !strings.HasSuffix(parsed.Path, "/") {
+			parsed.Path += "/"
+		}
 		client.BaseURL = parsed
 	}
 	return &Integration{client: client, options: options}, nil
-}
-
-func validateOptions(options *Options) error {
-	errs := []string{}
-	if options.Username == "" {
-		errs = append(errs, "Username")
-	}
-	if options.Owner == "" {
-		errs = append(errs, "Owner")
-	}
-	if options.Token == "" {
-		errs = append(errs, "Token")
-	}
-	if options.ProjectName == "" {
-		errs = append(errs, "ProjectName")
-	}
-
-	if len(errs) > 0 {
-		return errors.New("Mandatory reporting configuration fields are missing: " + strings.Join(errs, ","))
-	}
-
-	return nil
 }
 
 // CreateIssue creates an issue in the tracker

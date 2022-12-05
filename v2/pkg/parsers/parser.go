@@ -2,26 +2,27 @@ package parsers
 
 import (
 	"fmt"
-	"io/ioutil"
-	"os"
 	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v2"
 
-	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/nuclei/v2/pkg/catalog"
 	"github.com/projectdiscovery/nuclei/v2/pkg/catalog/loader/filter"
-	"github.com/projectdiscovery/nuclei/v2/pkg/model"
 	"github.com/projectdiscovery/nuclei/v2/pkg/templates"
 	"github.com/projectdiscovery/nuclei/v2/pkg/templates/cache"
 	"github.com/projectdiscovery/nuclei/v2/pkg/utils"
 	"github.com/projectdiscovery/nuclei/v2/pkg/utils/stats"
 )
 
-const mandatoryFieldMissingTemplate = "mandatory '%s' field is missing"
+const (
+	mandatoryFieldMissingTemplate = "mandatory '%s' field is missing"
+	invalidFieldFormatTemplate    = "invalid field format for '%s' (allowed format is %s)"
+)
 
 // LoadTemplate returns true if the template is valid and matches the filtering criteria.
-func LoadTemplate(templatePath string, tagFilter *filter.TagFilter, extraTags []string) (bool, error) {
-	template, templateParseError := ParseTemplate(templatePath)
+func LoadTemplate(templatePath string, tagFilter *filter.TagFilter, extraTags []string, catalog catalog.Catalog) (bool, error) {
+	template, templateParseError := ParseTemplate(templatePath, catalog)
 	if templateParseError != nil {
 		return false, templateParseError
 	}
@@ -30,25 +31,23 @@ func LoadTemplate(templatePath string, tagFilter *filter.TagFilter, extraTags []
 		return false, nil
 	}
 
-	templateInfo := template.Info
-	if validationError := validateMandatoryInfoFields(&templateInfo); validationError != nil {
+	if validationError := validateTemplateFields(template); validationError != nil {
+		stats.Increment(SyntaxErrorStats)
 		return false, validationError
 	}
 
-	return isTemplateInfoMetadataMatch(tagFilter, &templateInfo, extraTags)
+	return isTemplateInfoMetadataMatch(tagFilter, template, extraTags)
 }
 
 // LoadWorkflow returns true if the workflow is valid and matches the filtering criteria.
-func LoadWorkflow(templatePath string) (bool, error) {
-	template, templateParseError := ParseTemplate(templatePath)
+func LoadWorkflow(templatePath string, catalog catalog.Catalog) (bool, error) {
+	template, templateParseError := ParseTemplate(templatePath, catalog)
 	if templateParseError != nil {
 		return false, templateParseError
 	}
 
-	templateInfo := template.Info
-
 	if len(template.Workflows) > 0 {
-		if validationError := validateMandatoryInfoFields(&templateInfo); validationError != nil {
+		if validationError := validateTemplateFields(template); validationError != nil {
 			return false, validationError
 		}
 		return true, nil
@@ -57,12 +56,8 @@ func LoadWorkflow(templatePath string) (bool, error) {
 	return false, nil
 }
 
-func isTemplateInfoMetadataMatch(tagFilter *filter.TagFilter, templateInfo *model.Info, extraTags []string) (bool, error) {
-	templateTags := templateInfo.Tags.ToSlice()
-	templateAuthors := templateInfo.Authors.ToSlice()
-	templateSeverity := templateInfo.SeverityHolder.Severity
-
-	match, err := tagFilter.Match(templateTags, templateAuthors, templateSeverity, extraTags)
+func isTemplateInfoMetadataMatch(tagFilter *filter.TagFilter, template *templates.Template, extraTags []string) (bool, error) {
+	match, err := tagFilter.Match(template, extraTags)
 
 	if err == filter.ErrExcluded {
 		return false, filter.ErrExcluded
@@ -71,30 +66,43 @@ func isTemplateInfoMetadataMatch(tagFilter *filter.TagFilter, templateInfo *mode
 	return match, err
 }
 
-func validateMandatoryInfoFields(info *model.Info) error {
-	if info == nil {
-		return fmt.Errorf(mandatoryFieldMissingTemplate, "info")
-	}
+func validateTemplateFields(template *templates.Template) error {
+	info := template.Info
+
+	var errors []string
 
 	if utils.IsBlank(info.Name) {
-		return fmt.Errorf(mandatoryFieldMissingTemplate, "name")
+		errors = append(errors, fmt.Sprintf(mandatoryFieldMissingTemplate, "name"))
 	}
 
 	if info.Authors.IsEmpty() {
-		return fmt.Errorf(mandatoryFieldMissingTemplate, "author")
+		errors = append(errors, fmt.Sprintf(mandatoryFieldMissingTemplate, "author"))
 	}
+
+	if template.ID == "" {
+		errors = append(errors, fmt.Sprintf(mandatoryFieldMissingTemplate, "id"))
+	} else if !templateIDRegexp.MatchString(template.ID) {
+		errors = append(errors, fmt.Sprintf(invalidFieldFormatTemplate, "id", templateIDRegexp.String()))
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf(strings.Join(errors, ", "))
+	}
+
 	return nil
 }
 
 var (
 	parsedTemplatesCache *cache.Templates
 	ShouldValidate       bool
-	fieldErrorRegexp     = regexp.MustCompile(`not found in`)
+	NoStrictSyntax       bool
+	templateIDRegexp     = regexp.MustCompile(`^([a-zA-Z0-9]+[-_])*[a-zA-Z0-9]+$`)
 )
 
 const (
-	SyntaxWarningStats = "syntax-warnings"
-	SyntaxErrorStats   = "syntax-errors"
+	SyntaxWarningStats   = "syntax-warnings"
+	SyntaxErrorStats     = "syntax-errors"
+	RuntimeWarningsStats = "runtime-warnings"
 )
 
 func init() {
@@ -103,38 +111,28 @@ func init() {
 
 	stats.NewEntry(SyntaxWarningStats, "Found %d templates with syntax warning (use -validate flag for further examination)")
 	stats.NewEntry(SyntaxErrorStats, "Found %d templates with syntax error (use -validate flag for further examination)")
+	stats.NewEntry(RuntimeWarningsStats, "Found %d templates with runtime error (use -validate flag for further examination)")
 }
 
 // ParseTemplate parses a template and returns a *templates.Template structure
-func ParseTemplate(templatePath string) (*templates.Template, error) {
+func ParseTemplate(templatePath string, catalog catalog.Catalog) (*templates.Template, error) {
 	if value, err := parsedTemplatesCache.Has(templatePath); value != nil {
 		return value.(*templates.Template), err
 	}
-
-	f, err := os.Open(templatePath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	data, err := ioutil.ReadAll(f)
+	data, err := utils.ReadFromPathOrURL(templatePath, catalog)
 	if err != nil {
 		return nil, err
 	}
 
 	template := &templates.Template{}
-	if err := yaml.UnmarshalStrict(data, template); err != nil {
-		errString := err.Error()
-		if !fieldErrorRegexp.MatchString(errString) {
-			stats.Increment(SyntaxErrorStats)
-			return nil, err
-		}
-		stats.Increment(SyntaxWarningStats)
-		if ShouldValidate {
-			gologger.Error().Msgf("Syntax warnings for template %s: %s", templatePath, err)
-		} else {
-			gologger.Warning().Msgf("Syntax warnings for template %s: %s", templatePath, err)
-		}
+	if NoStrictSyntax {
+		err = yaml.Unmarshal(data, template)
+	} else {
+		err = yaml.UnmarshalStrict(data, template)
+	}
+	if err != nil {
+		stats.Increment(SyntaxErrorStats)
+		return nil, err
 	}
 	parsedTemplatesCache.Store(templatePath, template, nil)
 	return template, nil

@@ -6,7 +6,6 @@ import (
 	"encoding/gob"
 	"encoding/hex"
 	"io"
-	"io/ioutil"
 	"net/http"
 )
 
@@ -79,23 +78,6 @@ func newInternalResponse() *InternalResponse {
 	}
 }
 
-// Unused
-// func toInternalRequest(req *http.Request, target string, body []byte) *InternalRequest {
-// 	intReq := newInternalRquest()
-
-// 	intReq.Target = target
-// 	intReq.HTTPMajor = req.ProtoMajor
-// 	intReq.HTTPMinor = req.ProtoMinor
-// 	for k, v := range req.Header {
-// 		intReq.Headers[k] = v
-// 	}
-// 	intReq.Headers = req.Header
-// 	intReq.Method = req.Method
-// 	intReq.Body = body
-
-// 	return intReq
-// }
-
 func toInternalResponse(resp *http.Response, body []byte) *InternalResponse {
 	intResp := newInternalResponse()
 
@@ -122,17 +104,6 @@ func fromInternalResponse(intResp *InternalResponse) *http.Response {
 		StatusCode:    intResp.StatusCode,
 		Header:        intResp.Headers,
 		ContentLength: contentLength,
-		Body:          ioutil.NopCloser(bytes.NewReader(intResp.Body)),
+		Body:          io.NopCloser(bytes.NewReader(intResp.Body)),
 	}
 }
-
-// Unused
-// func fromInternalRequest(intReq *InternalRequest) *http.Request {
-// 	return &http.Request{
-// 		ProtoMinor:    intReq.HTTPMinor,
-// 		ProtoMajor:    intReq.HTTPMajor,
-// 		Header:        intReq.Headers,
-// 		ContentLength: int64(len(intReq.Body)),
-// 		Body:          ioutil.NopCloser(bytes.NewReader(intReq.Body)),
-// 	}
-// }

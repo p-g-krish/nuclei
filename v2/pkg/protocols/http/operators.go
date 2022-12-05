@@ -12,13 +12,14 @@ import (
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/helpers/responsehighlighter"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/utils"
 	"github.com/projectdiscovery/nuclei/v2/pkg/types"
 )
 
 // Match matches a generic data response again a given matcher
 func (request *Request) Match(data map[string]interface{}, matcher *matchers.Matcher) (bool, []string) {
-	item, ok := getMatchPart(matcher.Part, data)
-	if !ok {
+	item, ok := request.getMatchPart(matcher.Part, data)
+	if !ok && matcher.Type.MatcherType != matchers.DSLMatcher {
 		return false, []string{}
 	}
 
@@ -32,7 +33,7 @@ func (request *Request) Match(data map[string]interface{}, matcher *matchers.Mat
 	case matchers.SizeMatcher:
 		return matcher.Result(matcher.MatchSize(len(item))), []string{}
 	case matchers.WordsMatcher:
-		return matcher.ResultWithMatchedSnippet(matcher.MatchWords(item, request.dynamicValues))
+		return matcher.ResultWithMatchedSnippet(matcher.MatchWords(item, data))
 	case matchers.RegexMatcher:
 		return matcher.ResultWithMatchedSnippet(matcher.MatchRegex(item))
 	case matchers.BinaryMatcher:
@@ -57,8 +58,8 @@ func getStatusCode(data map[string]interface{}) (int, bool) {
 
 // Extract performs extracting operation for an extractor on model and returns true or false.
 func (request *Request) Extract(data map[string]interface{}, extractor *extractors.Extractor) map[string]struct{} {
-	item, ok := getMatchPart(extractor.Part, data)
-	if !ok {
+	item, ok := request.getMatchPart(extractor.Part, data)
+	if !ok && !extractors.SupportsMap(extractor) {
 		return nil
 	}
 	switch extractor.GetType() {
@@ -67,15 +68,20 @@ func (request *Request) Extract(data map[string]interface{}, extractor *extracto
 	case extractors.KValExtractor:
 		return extractor.ExtractKval(data)
 	case extractors.XPathExtractor:
-		return extractor.ExtractHTML(item)
+		return extractor.ExtractXPath(item)
 	case extractors.JSONExtractor:
 		return extractor.ExtractJSON(item)
+	case extractors.DSLExtractor:
+		return extractor.ExtractDSL(data)
 	}
 	return nil
 }
 
 // getMatchPart returns the match part honoring "all" matchers + others.
-func getMatchPart(part string, data output.InternalEvent) (string, bool) {
+func (request *Request) getMatchPart(part string, data output.InternalEvent) (string, bool) {
+	if part == "" {
+		part = "body"
+	}
 	if part == "header" {
 		part = "all_headers"
 	}
@@ -110,17 +116,24 @@ func (request *Request) responseToDSLMap(resp *http.Response, host, matched, raw
 		data[k] = strings.Join(v, " ")
 	}
 	data["host"] = host
+	data["type"] = request.Type().String()
 	data["matched"] = matched
 	data["request"] = rawReq
 	data["response"] = rawResp
 	data["status_code"] = resp.StatusCode
 	data["body"] = body
-	data["content_length"] = resp.ContentLength
 	data["all_headers"] = headers
+	data["header"] = headers
 	data["duration"] = duration.Seconds()
 	data["template-id"] = request.options.TemplateID
 	data["template-info"] = request.options.TemplateInfo
 	data["template-path"] = request.options.TemplatePath
+
+	data["content_length"] = utils.CalculateContentLength(resp.ContentLength, int64(len(body)))
+
+	if request.StopAtFirstMatch || request.options.StopAtFirstMatch {
+		data["stop-at-first-match"] = true
+	}
 	return data
 }
 
@@ -138,16 +151,25 @@ func (request *Request) MakeResultEventItem(wrapped *output.InternalWrappedEvent
 		TemplateID:       types.ToString(wrapped.InternalEvent["template-id"]),
 		TemplatePath:     types.ToString(wrapped.InternalEvent["template-path"]),
 		Info:             wrapped.InternalEvent["template-info"].(model.Info),
-		Type:             "http",
+		Type:             types.ToString(wrapped.InternalEvent["type"]),
 		Host:             types.ToString(wrapped.InternalEvent["host"]),
 		Matched:          types.ToString(wrapped.InternalEvent["matched"]),
 		Metadata:         wrapped.OperatorsResult.PayloadValues,
 		ExtractedResults: wrapped.OperatorsResult.OutputExtracts,
 		Timestamp:        time.Now(),
+		MatcherStatus:    true,
 		IP:               types.ToString(wrapped.InternalEvent["ip"]),
 		Request:          types.ToString(wrapped.InternalEvent["request"]),
-		Response:         types.ToString(wrapped.InternalEvent["response"]),
+		Response:         request.truncateResponse(wrapped.InternalEvent["response"]),
 		CURLCommand:      types.ToString(wrapped.InternalEvent["curl-command"]),
 	}
 	return data
+}
+
+func (request *Request) truncateResponse(response interface{}) string {
+	responseString := types.ToString(response)
+	if len(responseString) > request.options.Options.ResponseSaveSize {
+		return responseString[:request.options.Options.ResponseSaveSize]
+	}
+	return responseString
 }

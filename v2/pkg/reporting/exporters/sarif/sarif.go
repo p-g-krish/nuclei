@@ -1,29 +1,23 @@
 package sarif
 
 import (
-	"crypto/sha1"
-	"encoding/hex"
+	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
+	"path"
 	"sync"
 
-	"github.com/owenrumney/go-sarif/sarif"
 	"github.com/pkg/errors"
-
-	"github.com/projectdiscovery/nuclei/v2/pkg/model/types/severity"
+	"github.com/projectdiscovery/nuclei/v2/pkg/catalog/config"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
-	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/format"
-	"github.com/projectdiscovery/nuclei/v2/pkg/utils"
+	"github.com/projectdiscovery/sarif"
 )
 
 // Exporter is an exporter for nuclei sarif output format.
 type Exporter struct {
-	sarif *sarif.Report
-	run   *sarif.Run
-	mutex *sync.Mutex
-
-	home    string
+	sarif   *sarif.Report
+	mutex   *sync.Mutex
+	rulemap map[string]*int // contains rule-id && ruleIndex
+	rules   []sarif.ReportingDescriptor
 	options *Options
 }
 
@@ -35,107 +29,168 @@ type Options struct {
 
 // New creates a new sarif exporter integration client based on options.
 func New(options *Options) (*Exporter, error) {
-	report, err := sarif.New(sarif.Version210)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not create sarif exporter")
+	report := sarif.NewReport()
+	exporter := &Exporter{
+		sarif:   report,
+		mutex:   &sync.Mutex{},
+		rules:   []sarif.ReportingDescriptor{},
+		rulemap: map[string]*int{},
+		options: options,
+	}
+	return exporter, nil
+}
+
+// addToolDetails adds details of static analysis tool (i.e nuclei)
+func (exporter *Exporter) addToolDetails() {
+	driver := sarif.ToolComponent{
+		Name:         "Nuclei",
+		Organization: "ProjectDiscovery",
+		Product:      "Nuclei",
+		ShortDescription: &sarif.MultiformatMessageString{
+			Text: "Fast and Customizable Vulnerability Scanner",
+		},
+		FullDescription: &sarif.MultiformatMessageString{
+			Text: "Fast and customizable vulnerability scanner based on simple YAML based DSL",
+		},
+		FullName:        "Nuclei v" + config.Version,
+		SemanticVersion: "v" + config.Version,
+		DownloadURI:     "https://github.com/projectdiscovery/nuclei/releases",
+		Rules:           exporter.rules,
+	}
+	exporter.sarif.RegisterTool(driver)
+
+	reportloc := sarif.ArtifactLocation{
+		Uri: "file:///" + exporter.options.File,
+		Description: &sarif.Message{
+			Text: "Nuclei Sarif Report",
+		},
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, errors.Wrap(err, "could not get home dir")
+	invocation := sarif.Invocation{
+		CommandLine:   os.Args[0],
+		Arguments:     os.Args[1:],
+		ResponseFiles: []sarif.ArtifactLocation{reportloc},
 	}
-	templatePath := filepath.Join(home, "nuclei-templates")
+	exporter.sarif.RegisterToolInvocation(invocation)
+}
 
-	run := sarif.NewRun("nuclei", "https://github.com/projectdiscovery/nuclei")
-	return &Exporter{options: options, home: templatePath, sarif: report, run: run, mutex: &sync.Mutex{}}, nil
+// getSeverity in terms of sarif
+func (exporter *Exporter) getSeverity(severity string) (sarif.Level, string) {
+	switch severity {
+	case "critical":
+		return sarif.Error, "9.4"
+	case "high":
+		return sarif.Error, "8"
+	case "medium":
+		return sarif.Note, "5"
+	case "low":
+		return sarif.Note, "2"
+	case "info":
+		return sarif.None, "1"
+	}
+
+	return sarif.None, "9.5"
 }
 
 // Export exports a passed result event to sarif structure
-func (i *Exporter) Export(event *output.ResultEvent) error {
-	templatePath := strings.TrimPrefix(event.TemplatePath, i.home)
+func (exporter *Exporter) Export(event *output.ResultEvent) error {
+	exporter.mutex.Lock()
+	defer exporter.mutex.Unlock()
 
-	h := sha1.New()
-	_, _ = h.Write([]byte(event.Host))
-	templateID := event.TemplateID + "-" + hex.EncodeToString(h.Sum(nil))
+	severity := event.Info.SeverityHolder.Severity.String()
+	resultHeader := fmt.Sprintf("%v (%v) found on %v", event.Info.Name, event.TemplateID, event.Host)
+	resultLevel, vulnRating := exporter.getSeverity(severity)
 
-	fullDescription := format.MarkdownDescription(event)
-	sarifSeverity := getSarifSeverity(event)
+	// Extra metdata if generated sarif is uploaded to github security page
+	ghmeta := map[string]interface{}{}
+	ghmeta["tags"] = []string{"security"}
+	ghmeta["security-severity"] = vulnRating
 
-	var ruleName string
-	if utils.IsNotBlank(event.Info.Name) {
-		ruleName = event.Info.Name
+	// rule contain details of template
+	rule := sarif.ReportingDescriptor{
+		Id:   event.TemplateID,
+		Name: event.Info.Name,
+		FullDescription: &sarif.MultiformatMessageString{
+			// Points to template URL
+			Text: event.Info.Description + "\nMore details at\n" + event.TemplateURL + "\n",
+		},
+		Properties: ghmeta,
 	}
 
-	var templateURL string
-	if strings.HasPrefix(event.TemplatePath, i.home) {
-		templateURL = "https://github.com/projectdiscovery/nuclei-templates/blob/master" + templatePath
-	} else {
-		templateURL = "https://github.com/projectdiscovery/nuclei-templates"
-	}
-
-	var ruleDescription string
-	if utils.IsNotBlank(event.Info.Description) {
-		ruleDescription = event.Info.Description
-	}
-
-	i.mutex.Lock()
-	defer i.mutex.Unlock()
-
-	_ = i.run.AddRule(templateID).
-		WithDescription(ruleName).
-		WithHelp(fullDescription).
-		WithHelpURI(templateURL).
-		WithFullDescription(sarif.NewMultiformatMessageString(ruleDescription))
-	result := i.run.AddResult(templateID).
-		WithMessage(sarif.NewMessage().WithText(event.Host)).
-		WithLevel(sarifSeverity)
-
-		// Also write file match metadata to file
-	if event.Type == "file" && (event.FileToIndexPosition != nil && len(event.FileToIndexPosition) > 0) {
-		for file, line := range event.FileToIndexPosition {
-			result.WithLocation(sarif.NewLocation().WithMessage(sarif.NewMessage().WithText(ruleName)).WithPhysicalLocation(
-				sarif.NewPhysicalLocation().
-					WithArtifactLocation(sarif.NewArtifactLocation().WithUri(file)).
-					WithRegion(sarif.NewRegion().WithStartColumn(1).WithStartLine(line).WithEndLine(line).WithEndColumn(32)),
-			))
+	// Github Uses ShortDescription as title
+	if event.Info.Description != "" {
+		rule.ShortDescription = &sarif.MultiformatMessageString{
+			Text: resultHeader,
 		}
+	}
+
+	// If rule is added
+	ruleIndex := len(exporter.rules) - 1
+	if exporter.rulemap[rule.Id] == nil {
+		exporter.rulemap[rule.Id] = &ruleIndex
+		exporter.rules = append(exporter.rules, rule)
 	} else {
-		result.WithLocation(sarif.NewLocation().WithMessage(sarif.NewMessage().WithText(event.Host)).WithPhysicalLocation(
-			sarif.NewPhysicalLocation().
-				WithArtifactLocation(sarif.NewArtifactLocation().WithUri("README.md")).
-				WithRegion(sarif.NewRegion().WithStartColumn(1).WithStartLine(1).WithEndLine(1).WithEndColumn(1)),
-		))
+		ruleIndex = *exporter.rulemap[rule.Id]
 	}
+
+	// vulnerability target/location
+	location := sarif.Location{
+		Message: &sarif.Message{
+			Text: path.Join(event.Host, event.Path),
+		},
+		PhysicalLocation: sarif.PhysicalLocation{
+			ArtifactLocation: sarif.ArtifactLocation{
+				// github only accepts file:// protocol and local & relative files only
+				// to avoid errors // is used which also translates to file according to specification
+				Uri: "/" + event.Path,
+				Description: &sarif.Message{
+					Text: path.Join(event.Host, event.Path),
+				},
+			},
+		},
+	}
+
+	// vulnerability report/result
+	result := &sarif.Result{
+		RuleId:    rule.Id,
+		RuleIndex: ruleIndex,
+		Level:     resultLevel,
+		Kind:      sarif.Open,
+		Message: &sarif.Message{
+			Text: resultHeader,
+		},
+		Locations: []sarif.Location{location},
+		Rule: sarif.ReportingDescriptorReference{
+			Id: rule.Id,
+		},
+	}
+
+	exporter.sarif.RegisterResult(*result)
+
 	return nil
+
 }
 
-// getSarifSeverity returns the sarif severity
-func getSarifSeverity(event *output.ResultEvent) string {
-	switch event.Info.SeverityHolder.Severity {
-	case severity.Info:
-		return "note"
-	case severity.Low, severity.Medium:
-		return "warning"
-	case severity.High, severity.Critical:
-		return "error"
-	default:
-		return "note"
-	}
-}
+// Close Writes data and closes the exporter after operation
+func (exporter *Exporter) Close() error {
+	exporter.mutex.Lock()
+	defer exporter.mutex.Unlock()
 
-// Close closes the exporter after operation
-func (i *Exporter) Close() error {
-	i.mutex.Lock()
-	defer i.mutex.Unlock()
-
-	i.sarif.AddRun(i.run)
-	if len(i.run.Results) == 0 {
-		return nil // do not write when no results
+	if len(exporter.rules) == 0 {
+		// no output if there are no results
+		return nil
 	}
-	file, err := os.Create(i.options.File)
+	// links results and rules/templates
+	exporter.addToolDetails()
+
+	bin, err := exporter.sarif.Export()
 	if err != nil {
-		return errors.Wrap(err, "could not create sarif output file")
+		return errors.Wrap(err, "failed to generate sarif report")
 	}
-	defer file.Close()
-	return i.sarif.Write(file)
+	if err := os.WriteFile(exporter.options.File, bin, 0644); err != nil {
+		return errors.Wrap(err, "failed to create sarif file")
+	}
+
+	return nil
+
 }

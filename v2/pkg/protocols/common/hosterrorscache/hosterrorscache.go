@@ -7,8 +7,18 @@ import (
 	"strings"
 
 	"github.com/bluele/gcache"
+
 	"github.com/projectdiscovery/gologger"
 )
+
+// CacheInterface defines the signature of the hosterrorscache so that
+// users of Nuclei as embedded lib may implement their own cache
+type CacheInterface interface {
+	SetVerbose(verbose bool)            // log verbosely
+	Close()                             // close the cache
+	Check(value string) bool            // return true if the host should be skipped
+	MarkFailed(value string, err error) // record a failure (and cause) for the host
+}
 
 // Cache is a cache for host based errors. It allows skipping
 // certain hosts based on an error threshold.
@@ -16,7 +26,7 @@ import (
 // It uses an LRU cache internally for skipping unresponsive hosts
 // that remain so for a duration.
 type Cache struct {
-	MaxHostError int
+	MaxHostError  int
 	verbose       bool
 	failedTargets gcache.Cache
 }
@@ -24,17 +34,16 @@ type Cache struct {
 const DefaultMaxHostsCount = 10000
 
 // New returns a new host max errors cache
-func New(MaxHostError, maxHostsCount int) *Cache {
+func New(maxHostError, maxHostsCount int) *Cache {
 	gc := gcache.New(maxHostsCount).
 		ARC().
 		Build()
-	return &Cache{failedTargets: gc, MaxHostError: MaxHostError}
+	return &Cache{failedTargets: gc, MaxHostError: maxHostError}
 }
 
 // SetVerbose sets the cache to log at verbose level
-func (c *Cache) SetVerbose(verbose bool) *Cache {
+func (c *Cache) SetVerbose(verbose bool) {
 	c.verbose = verbose
-	return c
 }
 
 // Close closes the host errors cache
@@ -46,7 +55,6 @@ func (c *Cache) normalizeCacheValue(value string) string {
 	finalValue := value
 	if strings.HasPrefix(value, "http") {
 		if parsed, err := url.Parse(value); err == nil {
-
 			hostname := parsed.Host
 			finalPort := parsed.Port()
 			if finalPort == "" {
@@ -64,7 +72,7 @@ func (c *Cache) normalizeCacheValue(value string) string {
 }
 
 // ErrUnresponsiveHost is returned when a host is unresponsive
-//var ErrUnresponsiveHost = errors.New("skipping as host is unresponsive")
+// var ErrUnresponsiveHost = errors.New("skipping as host is unresponsive")
 
 // Check returns true if a host should be skipped as it has been
 // unresponsive for a certain number of times.
@@ -99,7 +107,10 @@ func (c *Cache) Check(value string) bool {
 }
 
 // MarkFailed marks a host as failed previously
-func (c *Cache) MarkFailed(value string) {
+func (c *Cache) MarkFailed(value string, err error) {
+	if !c.checkError(err) {
+		return
+	}
 	finalValue := c.normalizeCacheValue(value)
 	if !c.failedTargets.Has(finalValue) {
 		_ = c.failedTargets.Set(finalValue, 1)
@@ -116,11 +127,11 @@ func (c *Cache) MarkFailed(value string) {
 	_ = c.failedTargets.Set(finalValue, numberOfErrorsValue+1)
 }
 
-var checkErrorRegexp = regexp.MustCompile(`(no address found for host|Client\.Timeout exceeded while awaiting headers|could not resolve host)`)
+var checkErrorRegexp = regexp.MustCompile(`(no address found for host|Client\.Timeout exceeded while awaiting headers|could not resolve host|connection refused)`)
 
-// CheckError checks if an error represents a type that should be
+// checkError checks if an error represents a type that should be
 // added to the host skipping table.
-func (c *Cache) CheckError(err error) bool {
+func (c *Cache) checkError(err error) bool {
 	errString := err.Error()
 	return checkErrorRegexp.MatchString(errString)
 }

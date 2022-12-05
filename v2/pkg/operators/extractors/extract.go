@@ -1,11 +1,11 @@
 package extractors
 
 import (
-	"strings"
-
 	"encoding/json"
-
+	"fmt"
 	"github.com/antchfx/htmlquery"
+	"github.com/antchfx/xmlquery"
+	"strings"
 
 	"github.com/projectdiscovery/nuclei/v2/pkg/types"
 )
@@ -34,8 +34,18 @@ func (e *Extractor) ExtractRegex(corpus string) map[string]struct{} {
 
 // ExtractKval extracts key value pairs from a data map
 func (e *Extractor) ExtractKval(data map[string]interface{}) map[string]struct{} {
-	results := make(map[string]struct{})
+	if e.CaseInsensitive {
+		inputData := data
+		data = make(map[string]interface{}, len(inputData))
+		for k, v := range inputData {
+			if s, ok := v.(string); ok {
+				v = strings.ToLower(s)
+			}
+			data[strings.ToLower(k)] = v
+		}
+	}
 
+	results := make(map[string]struct{})
 	for _, k := range e.KVal {
 		item, ok := data[k]
 		if !ok {
@@ -49,7 +59,15 @@ func (e *Extractor) ExtractKval(data map[string]interface{}) map[string]struct{}
 	return results
 }
 
-// ExtractHTML extracts items from text using XPath selectors
+// ExtractXPath extracts items from text using XPath selectors
+func (e *Extractor) ExtractXPath(corpus string) map[string]struct{} {
+	if strings.HasPrefix(corpus, "<?xml") {
+		return e.ExtractXML(corpus)
+	}
+	return e.ExtractHTML(corpus)
+}
+
+// ExtractHTML extracts items from HTML using XPath selectors
 func (e *Extractor) ExtractHTML(corpus string) map[string]struct{} {
 	results := make(map[string]struct{})
 
@@ -69,6 +87,36 @@ func (e *Extractor) ExtractHTML(corpus string) map[string]struct{} {
 				value = htmlquery.SelectAttr(node, e.Attribute)
 			} else {
 				value = htmlquery.InnerText(node)
+			}
+			if _, ok := results[value]; !ok {
+				results[value] = struct{}{}
+			}
+		}
+	}
+	return results
+}
+
+// ExtractXML extracts items from XML using XPath selectors
+func (e *Extractor) ExtractXML(corpus string) map[string]struct{} {
+	results := make(map[string]struct{})
+
+	doc, err := xmlquery.Parse(strings.NewReader(corpus))
+	if err != nil {
+		return results
+	}
+
+	for _, k := range e.XPath {
+		nodes, err := xmlquery.QueryAll(doc, k)
+		if err != nil {
+			continue
+		}
+		for _, node := range nodes {
+			var value string
+
+			if e.Attribute != "" {
+				value = node.SelectAttr(e.Attribute)
+			} else {
+				value = node.InnerText()
 			}
 			if _, ok := results[value]; !ok {
 				results[value] = struct{}{}
@@ -111,5 +159,26 @@ func (e *Extractor) ExtractJSON(corpus string) map[string]struct{} {
 			}
 		}
 	}
+	return results
+}
+
+// ExtractDSL execute the expression and returns the results
+func (e *Extractor) ExtractDSL(data map[string]interface{}) map[string]struct{} {
+	results := make(map[string]struct{})
+
+	for _, compiledExpression := range e.dslCompiled {
+		result, err := compiledExpression.Evaluate(data)
+		if err != nil {
+			return results
+		}
+
+		if result != nil {
+			resultString := fmt.Sprint(result)
+			if resultString != "" {
+				results[resultString] = struct{}{}
+			}
+		}
+	}
+
 	return results
 }

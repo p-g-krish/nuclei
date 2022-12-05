@@ -1,16 +1,16 @@
 package dedupe
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 
-	"github.com/projectdiscovery/nuclei/v2/pkg/output"
 	"github.com/stretchr/testify/require"
+
+	"github.com/projectdiscovery/nuclei/v2/pkg/output"
 )
 
 func TestDedupeDuplicates(t *testing.T) {
-	tempDir, err := ioutil.TempDir("", "nuclei")
+	tempDir, err := os.MkdirTemp("", "nuclei")
 	require.Nil(t, err, "could not create temporary storage")
 	defer os.RemoveAll(tempDir)
 
