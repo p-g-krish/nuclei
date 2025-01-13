@@ -1,13 +1,51 @@
-cmd/nuclei/nuclei*
-v2/cmd/nuclei/nuclei
+# Misc
+**/*-cache
+**/*-config
+**/.cache
+**/*.DS_Store
+**/*.exe
+.devcontainer
+.gitignore
 .idea
-integration_tests/integration-test
-integration_tests/nuclei
-v2/cmd/integration-test/integration-test
-bin
-v2/pkg/protocols/common/helpers/deserialization/testdata/Deserialize.class
-v2/pkg/protocols/common/helpers/deserialization/testdata/ValueObject.class
-v2/pkg/protocols/common/helpers/deserialization/testdata/ValueObject2.ser
-v2/cmd/functional-test/nuclei_dev
-v2/cmd/functional-test/nuclei_main
-v2/cmd/functional-test/functional-test
+.vscode
+
+# Binaries
+/bin/*
+/bindgen
+/debug-*
+/docgen
+/functional-test
+/fuzzplayground
+/integration-test
+/jsdocgen
+/main
+/memogen
+/nuclei
+/nuclei-stats*
+/nuclei_dev
+/nuclei_main
+/scan-charts
+/scrapefunc
+/scrapefuncs
+/tsgen
+
+# Templates
+/*.yaml
+
+# Generated docs
+/dsl.md
+
+# Junk
+dist
+pkg/protocols/common/helpers/deserialization/testdata/Deserialize.class
+pkg/protocols/common/helpers/deserialization/testdata/ValueObject.class
+pkg/protocols/common/helpers/deserialization/testdata/ValueObject2.ser
+vendor
+
+# Headless `screenshot` action
+*.png
+
+# Profiling & tracing
+*.prof
+*.pprof
+*.trace
